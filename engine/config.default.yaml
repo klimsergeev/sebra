@@ -1,0 +1,46 @@
+# Настройки Sebra. Меняются только командой: python3 engine/scripts/config.py set <ключ> <значение>
+
+owner:
+  timezone: "UTC"              # часовой пояс пользователя, имя зоны вида Europe/Moscow
+
+git:
+  author_name: ""              # пусто — автор изменений Claude
+  author_email: ""             # оба поля пустые или оба заполнены
+
+gardener:
+  time: "04:07"                # время рутины садовника; то же — в форме рутины
+
+summary:
+  time: "09:07"                # время рутины сводки; то же — в форме рутины
+
+weekly:
+  day: "sunday"                # день недельного обзора и слияния правил
+
+tasks:
+  stuck_after_days: 14         # задача без движения дольше — зависшая
+  delete_after_days: 30        # сделанная или отменённая задача удаляется через столько дней
+
+big_docs:
+  text_words: 8000             # md, txt, страница, письмо, eml, rtf, epub, прочий текст
+  pdf_pages: 20                # PDF с текстом
+  scan_pages: 5                # PDF-скан, фото документа
+  doc_pages: 20                # docx, odt, doc; страница — из свойств файла, иначе 400 слов
+  slides: 20                   # pptx, odp
+  table_rows: 5000             # csv, tsv
+  sheet_cells: 5000            # xlsx, ods — заполненные ячейки
+  sheets: 5                    # xlsx, ods — листов
+
+language:
+  main: "ru"
+  translate_quotes: true       # цитата не на русском — рядом перевод
+
+# Модели агентов: opus, sonnet, haiku или fable. Значение переносится в поле model файла агента.
+agents:
+  intake: "opus"               # модель приёма присланного
+  answer: "opus"               # модель ответов на вопросы по базе
+  digester: "opus"             # модель разбора больших документов
+  gardener: "opus"             # модель садовника
+  reporter: "sonnet"           # модель сводок и недельного обзора
+  rules: "opus"                # модель правил из поправок
+  challenger: "fable"          # модель спорщика
+  restorer: "sonnet"           # модель отката и удаления

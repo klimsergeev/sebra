@@ -1,0 +1,2 @@
+# Переименования и удаления ключей config.yaml между версиями движка; читает python3 engine/scripts/config.py migrate
+[]

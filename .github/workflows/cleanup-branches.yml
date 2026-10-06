@@ -1,0 +1,20 @@
+# Удаляет ветки claude/…, вся работа которых уже есть в main. Вся логика — в engine/scripts/cleanup_branches.py.
+# Файл заморожен и не меняется между версиями движка: облачная сессия не может отправить правку .github/workflows/.
+name: cleanup-branches
+
+on:
+  schedule:
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+
+jobs:
+  cleanup:
+    if: github.repository != 'klimsergeev/sebra'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - run: python3 engine/scripts/cleanup_branches.py

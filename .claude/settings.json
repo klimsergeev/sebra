@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "deny": [
+      "Edit(/README.md)", "Edit(/CLAUDE.md)", "Edit(/.gitattributes)", "Edit(/.gitignore)",
+      "Edit(/.claude/**)", "Edit(/.github/**)", "Edit(/.git/**)", "Edit(/engine/**)",
+      "Edit(/engine.lock)", "Edit(/config.yaml)", "Edit(/data/log/**)", "Edit(/data/reminders/**)",
+      "NotebookEdit", "Monitor", "Agent(fork)", "Agent(model:*)",
+      "Bash(rm *)", "Bash(rmdir *)", "Bash(unlink *)", "Bash(mv *)", "Bash(find *-delete*)",
+      "Bash(git push *)", "Bash(git commit *)", "Bash(git add *)", "Bash(git rm *)", "Bash(git mv *)",
+      "Bash(git reset *)", "Bash(git rebase *)", "Bash(git revert *)", "Bash(git merge *)", "Bash(git pull *)",
+      "Bash(git stash *)", "Bash(git clean *)", "Bash(git switch *)", "Bash(git checkout *)", "Bash(git tag *)",
+      "Bash(git config *)", "Bash(git cherry-pick *)", "Bash(git update-ref *)", "Bash(git gc *)",
+      "Bash(git filter-branch *)", "Bash(git filter-repo *)",
+      "Bash(git branch -d *)", "Bash(git branch -D *)", "Bash(git branch -m *)", "Bash(git branch -M *)",
+      "Bash(git branch -f *)", "Bash(git branch --delete *)", "Bash(git branch --move *)", "Bash(git branch --force *)"
+    ],
+    "allow": [
+      "Bash(python3 engine/scripts/*)", "Bash(pdftotext *)", "Bash(mkdir -p /tmp/sebra)",
+      "Bash(git fetch *)", "Bash(git ls-remote *)", "Bash(git restore *)", "WebFetch",
+      "Edit(//tmp/sebra/**)", "Read(//tmp/sebra/**)", "Read(//root/.claude/uploads/**)"
+    ]
+  },
+  "env": {
+    "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"
+  },
+  "hooks": {
+    "SessionStart": [{ "hooks": [{ "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/engine/scripts/session_start.py\"", "timeout": 30 }] }],
+    "PreToolUse": [{ "matcher": "Write|Edit|Bash", "hooks": [{ "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/engine/scripts/guard.py\"", "timeout": 10 }] }]
+  }
+}
