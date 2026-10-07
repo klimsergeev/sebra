@@ -25,7 +25,7 @@ class Parser(argparse.ArgumentParser):
 
 def show(value):
     if isinstance(value, bool):
-        return "true" if value else "false"
+        return common.format_value(value)
     return str(value)
 
 

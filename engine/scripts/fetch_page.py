@@ -23,7 +23,6 @@ from common import Fail
 
 WORK = "/tmp/sebra"
 TMP_ROOTS = sorted({WORK, os.path.realpath(WORK)})
-MAX_CHARS = 200000
 SKIP = {"script", "style", "noscript", "template", "svg"}
 BLOCK = {"address", "article", "aside", "blockquote", "br", "dd", "details", "dialog", "div", "dl", "dt",
          "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hr",
@@ -171,20 +170,14 @@ def run(args):
     if not text.strip():
         raise Fail(1, "текста нет: страница, видимо, собирается браузером")
     words = len(text.split())
-    truncated = False
     result = {"url": args.url, "final_url": final_url, "status": status, "content_type": content_type,
               "title": title}
     if args.text_out:
         with open(args.text_out, "w", encoding="utf-8", newline="\n") as f:
             f.write(text if text.endswith("\n") else text + "\n")
     else:
-        if len(text) > MAX_CHARS:
-            text = text[:MAX_CHARS] + "\n[… обрезано: показаны первые %d знаков; полный текст — с --text-out]" \
-                % MAX_CHARS
-            truncated = True
         result["text"] = text
     result["words"] = words
-    result["truncated"] = truncated
     if args.json:
         print(json.dumps(result, ensure_ascii=False))
     elif args.text_out:

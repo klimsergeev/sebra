@@ -2,8 +2,7 @@
 
 python3 engine/scripts/commit.py --who <исполнитель> --message "<что>" [--json] [<пути…>]
 
-Протокол — план Sebra, раздел «Скрипты», подраздел «commit.py». Никогда не отправляет с --force и никогда не
-отправляет ветку сессии: только `git push origin HEAD:main`.
+Никогда не отправляет с --force и никогда не отправляет ветку сессии: только `git push origin HEAD:main`.
 """
 
 import argparse
@@ -118,7 +117,12 @@ def ahead_of_main():
 
 
 def author_env(extra=None):
-    """Автор и коммиттер из config.yaml (оба поля заданы) — для commit и для всех rebase."""
+    """Автор из config.yaml (оба поля заданы) — для commit и для всех rebase.
+
+    Коммиттер — по умолчанию копии: в облаке это Claude <noreply@anthropic.com> с подписью, и GitHub показывает
+    коммит как Verified; коммиттер из настроек при той же подписи — Unverified, и стоп-хук облака требует переписать
+    коммит. Только если git сам коммиттера не знает (git var GIT_COMMITTER_IDENT — отказ), коммиттер — тоже из настроек.
+    """
     env = dict(extra or {})
     try:
         cfg = common.config()
@@ -127,8 +131,9 @@ def author_env(extra=None):
         return env
     name, email = cfg.get("git.author_name") or "", cfg.get("git.author_email") or ""
     if isinstance(name, str) and isinstance(email, str) and name and email:
-        env.update({"GIT_AUTHOR_NAME": name, "GIT_AUTHOR_EMAIL": email,
-                    "GIT_COMMITTER_NAME": name, "GIT_COMMITTER_EMAIL": email})
+        env.update({"GIT_AUTHOR_NAME": name, "GIT_AUTHOR_EMAIL": email})
+        if common.git("var", "GIT_COMMITTER_IDENT", check=False).returncode != 0:
+            env.update({"GIT_COMMITTER_NAME": name, "GIT_COMMITTER_EMAIL": email})
     return env
 
 
@@ -392,6 +397,7 @@ def run(args, res):
             res.files = [f for f in common.git_out("diff-tree", "--no-commit-id", "--name-only", "-r",
                                                    "--no-renames", "HEAD").split("\n") if f]
     if not res.files and not ahead_of_main():
+        common.forget_session_ref()
         res.status = "nothing"
         return 0, "нечего сохранять"
 
@@ -406,6 +412,8 @@ def run(args, res):
     # явный refspec: у облачной копии обычный fetch может не создавать origin/main, а upstream нужна эта ссылка
     common.git("fetch", "origin", common.MAIN_REFSPEC, check=False, timeout=180)
     common.set_upstream_main()
+    # стоп-хук облака сравнивает ветку с origin/<ветка>, если она есть: без неё — с origin/HEAD = main
+    common.forget_session_ref()
     if res.conflicts:
         res.status = "partial"
         lines = ["сохранено всё, кроме: %s — их одновременно изменила другая сессия;" %

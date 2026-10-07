@@ -25,6 +25,8 @@
   },
   "hooks": {
     "SessionStart": [{ "hooks": [{ "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/engine/scripts/session_start.py\"", "timeout": 30 }] }],
-    "PreToolUse": [{ "matcher": "Write|Edit|Bash", "hooks": [{ "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/engine/scripts/guard.py\"", "timeout": 10 }] }]
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/engine/scripts/deliver.py\" hook-prompt", "timeout": 25 }] }],
+    "PreToolUse": [{ "matcher": "Write|Edit|Bash", "hooks": [{ "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/engine/scripts/guard.py\"", "timeout": 10 }] }],
+    "Stop": [{ "hooks": [{ "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/engine/scripts/deliver.py\" hook-stop", "timeout": 30 }] }]
   }
 }

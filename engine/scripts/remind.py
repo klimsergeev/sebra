@@ -3,7 +3,6 @@
 python3 engine/scripts/remind.py add --who <seb-intake | seb-digester> --date <ГГГГ-ММ-ДД> --text "<что напомнить>" --record <путь записи> [--json]
 python3 engine/scripts/remind.py cancel --who <seb-intake | seb-restorer> --date <ГГГГ-ММ-ДД> --record <путь записи> [--text "<начало текста>"] [--json]
 python3 engine/scripts/remind.py show --through <ГГГГ-ММ-ДД> [--json]
-python3 engine/scripts/remind.py done --through <ГГГГ-ММ-ДД> [--json]
 
 Строка файла — `- <текст> — [запись](../records/<имя записи>.md)`. Сегодня — по поясу пользователя.
 """
@@ -174,6 +173,41 @@ def day_files(through):
     return out, errors
 
 
+def drop_lines(items, who):
+    """Убирает ровно показанные строки: items — [{"file": data/reminders/<дата>.md, "line": строка}].
+
+    Строки, которых уже нет (убрала другая сессия, отменил пользователь), пропускаются; опустевший файл удаляется;
+    на каждый изменённый файл — строка журнала «напоминания показаны». Возвращает (изменённые, удалённые).
+    """
+    wanted = {}
+    for it in items:
+        rel, line = it.get("file"), it.get("line")
+        name = os.path.basename(rel or "")
+        if rel != "%s/%s" % (common.REMINDERS, name) or not FILE_NAME.match(name) or not isinstance(line, str):
+            raise Fail(2, "строка напоминания не из data/reminders/: %r" % (it,))
+        wanted.setdefault(rel, set()).add(line)
+    changed, deleted = [], []
+    handle = lock()
+    try:
+        for rel in sorted(wanted):
+            lines = read_lines(rel)
+            if lines is None:
+                continue
+            kept = [x for x in lines if x not in wanted[rel]]
+            if len(kept) == len(lines):
+                continue
+            if not [x for x in kept if x.strip()]:
+                os.remove(common.path(rel))
+                deleted.append(rel)
+            else:
+                common.write_atomic(rel, "\n".join(kept) + "\n")
+                changed.append(rel)
+            common.journal_add(who, "напоминания показаны", rel)
+    finally:
+        handle.close()
+    return changed, deleted
+
+
 def cmd_show(args):
     through = parse_day(args.through, "--through")
     files, errors = day_files(through)
@@ -203,25 +237,6 @@ def cmd_show(args):
     return 0
 
 
-def cmd_done(args):
-    through = parse_day(args.through, "--through")
-    handle = lock()
-    deleted = []
-    try:
-        files, _ = day_files(through)
-        for _, rel in files:
-            os.remove(common.path(rel))
-            common.journal_add("summary", "напоминания отправлены", rel)
-            deleted.append(rel)
-    finally:
-        handle.close()
-    if args.json:
-        print(json.dumps({"deleted": deleted}, ensure_ascii=False))
-    else:
-        print("удалены: %s" % (", ".join(deleted) or "нет"))
-    return 0
-
-
 def main():
     p = Parser(prog="remind.py")
     sub = p.add_subparsers(dest="cmd")
@@ -237,16 +252,15 @@ def main():
     s.add_argument("--record", required=True)
     s.add_argument("--text")
     s.add_argument("--json", action="store_true")
-    for name in ("show", "done"):
-        s = sub.add_parser(name)
-        s.add_argument("--through", required=True)
-        s.add_argument("--json", action="store_true")
+    s = sub.add_parser("show")
+    s.add_argument("--through", required=True)
+    s.add_argument("--json", action="store_true")
     for sp in sub.choices.values():
         sp.error = p.error
     args = p.parse_args()
-    handlers = {"add": cmd_add, "cancel": cmd_cancel, "show": cmd_show, "done": cmd_done}
+    handlers = {"add": cmd_add, "cancel": cmd_cancel, "show": cmd_show}
     if args.cmd not in handlers:
-        raise Fail(2, "команда: add, cancel, show или done")
+        raise Fail(2, "команда: add, cancel или show")
     return handlers[args.cmd](args)
 
 

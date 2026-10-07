@@ -3,8 +3,7 @@
 python3 engine/scripts/lint.py [--json] [пути…]
 
 Без путей проверяет всю базу; с путями — только эти файлы (все правила, кроме root, layout и engine).
-Правила и их имена — план Sebra (dev/plans/plan-sebra-2026-10-06.md в sebra-dev), раздел «Скрипты», подраздел
-«lint.py»; форматы — engine/docs/formats.md.
+Форматы — engine/docs/formats.md.
 Коды: 0 — нарушений нет; 1 — есть нарушения; 2 — ошибка вызова; 3 — окружение.
 """
 
@@ -93,6 +92,11 @@ QUOTE_CHARS = {ord(c): None for c in "«»“”„\"'"}
 GARDENER_ACTIONS = ("слито", "исправлено", "пересобрано из записи", "противоречие", "привязано", "устарело", "удалено")
 UNREADABLE_BODY = re.compile(r"Содержимое не читается: \S[^\n]*\n?")
 IMAGE_LINE = "Что на картинке: "
+# Текст сводки и обзора пользователь видит как есть, ссылки — их текстом (deliver.py): путей и имён файлов в нём нет.
+# Ссылка любой формы заменяется текстом: ссылку не по форме ловит правило link, а не это.
+LINK_AS_TEXT = re.compile(r"\[([^\]]+)\]\([^)\n]*\)")
+WEB_ADDRESS = re.compile(r"https?://\S+")
+REPORT_PATH = re.compile(r"(?<![\w/.-])data/|/tmp/|[\w.-]+\.(?:md|py)\b")
 
 # ---------------------------------------------------------------- engine.lock
 
@@ -348,7 +352,7 @@ class Lint:
         return self._files
 
     def translate_quotes(self):
-        """language.translate_quotes из config.yaml; не читается — true, как в умолчаниях."""
+        """language.translate_quotes из config.yaml; не читается — yes, как в умолчаниях."""
         if self._translate is None:
             self._translate = True
             text = self.text_of(common.CONFIG)
@@ -541,8 +545,6 @@ class Lint:
             self.check_facts(rel, kind, body, offset)
         if kind == "index":
             self.check_index(rel, body)
-        if kind == "rules":
-            self.check_rules_length(rel, text)
 
     def check_name(self, rel, kind):
         name = os.path.basename(rel)
@@ -853,6 +855,8 @@ class Lint:
                 m = RULE.match(line)
                 if not m or not real_date(m.group("d")):
                     self.add(rel, "items", "строка %d: правило — «- ГГГГ-ММ-ДД — делать …» или «… — не делать …»" % n)
+        if kind in REPORT_KINDS:
+            self.check_report_text(rel, body, offset)
         if kind == "daily" and "Дела на день" in sections:
             for n, line, code in sections["Дела на день"]:
                 if code or not line.strip() or line.startswith("### ") or line.strip() == "нет":
@@ -860,6 +864,16 @@ class Lint:
                 m = DAILY_TASK.match(line)
                 if not m or not in_folder(resolve(rel, m.group("target")), common.TASKS):
                     self.add(rel, "items", "строка %d: в «Делах на день» задача — ссылкой на файл data/tasks/" % n)
+
+    def check_report_text(self, rel, body, offset):
+        """Путь или имя файла в тексте сводки и обзора — после замены ссылок их текстом, без веб-адресов."""
+        for n, line in enumerate(body.split("\n"), 1):
+            seen = WEB_ADDRESS.sub("", LINK_AS_TEXT.sub(r"\1", line))
+            m = REPORT_PATH.search(seen)
+            if m:
+                self.add(rel, "items", "строка %d: путь или имя файла «%s» в тексте — пользователь видит его как есть; "
+                         "страница или задача — ссылкой с названием" % (n + offset, short(m.group(0))))
+                return
 
     def check_link_items(self, rel, title, lines, folder):
         for n, line, _ in lines:
@@ -1257,9 +1271,29 @@ class Lint:
             if expected is not None and expected != text:
                 got, want = text.split("\n"), expected.split("\n")
                 n = next((i for i, (a, b) in enumerate(zip(got, want)) if a != b), min(len(got), len(want)))
-                self.add(rel, "config", "строка %d не как в engine/config.default.yaml (отличаться может только значение): "
-                                        "«%s»" % (n + 1, short(got[n] if n < len(got) else "")))
+                key = self.bool_word_key(got[n] if n < len(got) else "", n, values, defaults)
+                if key:
+                    self.add(rel, "config", "%s: пишется yes или no — «%s»" % (key, short(got[n])))
+                else:
+                    self.add(rel, "config", "строка %d не как в engine/config.default.yaml (отличаться может только "
+                                            "значение): «%s»" % (n + 1, short(got[n] if n < len(got) else "")))
         self.check_agent_models(values)
+
+    @staticmethod
+    def bool_word_key(line, n, values, defaults):
+        """Ключ, если строка n файла — тот же ключ шаблона с булевым умолчанием, значение читается как булево,
+        но написано не yes/no (true, False, on…); иначе None — тогда сообщение общее."""
+        slot = next((k for i, k, _, _ in common.template()[1] if i == n), None)
+        if not slot or not isinstance(defaults.get(slot), bool) or not isinstance(values.get(slot), bool):
+            return None
+        m = re.match(r"\s+%s:\s*(.*)$" % re.escape(slot.split(".", 1)[1]), line)
+        if not m:
+            return None
+        try:
+            word = common._split_value(m.group(1))[0]
+        except ValueError:
+            return None
+        return slot if word != common.format_value(values[slot]) else None
 
     def check_agent_models(self, values):
         rel = common.CONFIG
@@ -1281,15 +1315,6 @@ class Lint:
             m = AGENT_FILE.fullmatch(f)
             if m and m.group("name") not in keys:
                 self.add(rel, "config", "файл агента %s есть, а ключа agents.%s нет" % (f, m.group("name")))
-
-    def check_rules_length(self, rel, text):
-        total = len(text.splitlines())
-        claude = self.abs("CLAUDE.md")
-        if os.path.isfile(claude):
-            with open(claude, encoding="utf-8", errors="replace") as f:
-                total += len(f.read().splitlines())
-        if total > 200:
-            self.add(rel, "rules-length", "CLAUDE.md и rules.local.md вместе %d строк, можно не больше 200" % total)
 
     # ---------------------------------------------------------- запуск
 

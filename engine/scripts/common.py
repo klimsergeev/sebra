@@ -274,7 +274,7 @@ def template(rel=CONFIG_DEFAULT):
 
 def format_value(value):
     if isinstance(value, bool):
-        return "true" if value else "false"
+        return "yes" if value else "no"
     if isinstance(value, int):
         return str(value)
     return json.dumps(value, ensure_ascii=False)
@@ -300,12 +300,15 @@ def tz_database_missing():
 
 TIME_KEYS = ("gardener.time", "summary.time")
 
+# Булево в настройках: файл пишется yes/no; командная строка принимает и true/false — в файл всё равно ляжет yes/no.
+BOOL_WORDS = {"yes": True, "no": False, "true": True, "false": False}
+
 
 def check_value(key, value, default):
     """Проверка одного значения по таблице раздела «Форматы», «Настройки»; текст ошибки или None."""
     want = type(default)
     if type(value) is not want:
-        names = {str: "строка", int: "целое число", bool: "true или false"}
+        names = {str: "строка", int: "целое число", bool: "yes или no"}
         return "%s: нужно %s" % (key, names.get(want, want.__name__))
     if key == "owner.timezone":
         import zoneinfo
@@ -360,9 +363,10 @@ def check_config(values, defaults_):
 def parse_cli_value(key, raw, default):
     """Значение из командной строки по типу умолчания; (значение, ошибка)."""
     if isinstance(default, bool):
-        if raw not in ("true", "false"):
-            return None, "%s: нужно true или false" % key
-        value = raw == "true"
+        word = raw.strip().lower()
+        if word not in BOOL_WORDS:
+            return None, "%s: нужно yes или no" % key
+        value = BOOL_WORDS[word]
     elif isinstance(default, int):
         if not re.fullmatch(r"[0-9]+", raw):
             return None, "%s: нужно целое число" % key
@@ -583,6 +587,38 @@ def set_upstream_main():
     if MAIN_REFSPEC not in specs:
         git("config", "--add", "remote.origin.fetch", MAIN_REFSPEC, check=False)
     return git("branch", "--set-upstream-to=origin/main", check=False).returncode == 0
+
+
+def sync_main(timeout=15):
+    """Догнать origin/main, если копия чиста и отстаёт; вернуть, на сколько коммитов копия позади main."""
+    # до fetch: и без сети стоп-хук облака не должен сравнивать ветку с локальной ссылкой origin/claude/…
+    forget_session_ref()
+    git("fetch", "origin", MAIN_REFSPEC, timeout=timeout)
+    behind_ancestor = git("merge-base", "--is-ancestor", "HEAD", "origin/main", check=False).returncode == 0
+    dirty = git_out("status", "--porcelain", "--untracked-files=no")
+    if behind_ancestor and not dirty:
+        git("merge", "--ff-only", "origin/main")
+    # как в commit.py: git status облака видит ветку сессии вровень с main
+    set_upstream_main()
+    return int(git_out("rev-list", "--count", "HEAD..origin/main"))
+
+
+def forget_session_ref():
+    """Стоп-хук облака сравнивает ветку сессии с origin/<ветка>, а без неё — с origin/HEAD.
+
+    Облако при старте заводит локальную ссылку refs/remotes/origin/claude/…, а commit.py отправляет в main: ссылка
+    остаётся позади, и хук просит отправить ветку. Функция удаляет эту ссылку (только локальную: на GitHub ничего не
+    меняется; текущая ветка — не main) и ставит origin/HEAD на origin/main, если origin/main есть. Ошибки git не
+    поднимает.
+    """
+    branch = git("symbolic-ref", "-q", "--short", "HEAD", check=False).stdout.strip()
+    if branch and branch != "main":
+        ref = "refs/remotes/origin/%s" % branch
+        if git("show-ref", "--verify", "-q", ref, check=False).returncode == 0:
+            git("update-ref", "-d", ref, check=False)
+    if git("show-ref", "--verify", "-q", "refs/remotes/origin/main", check=False).returncode == 0:
+        if git("symbolic-ref", "-q", "refs/remotes/origin/HEAD", check=False).stdout.strip() != "refs/remotes/origin/main":
+            git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main", check=False)
 
 
 def ensure_history():

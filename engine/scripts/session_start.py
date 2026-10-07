@@ -10,6 +10,7 @@ import os
 import sys
 
 import common
+import deliver
 from common import Fail
 
 
@@ -23,14 +24,7 @@ def read_source():
 
 def sync():
     """Догнать origin/main; строка о состоянии копии."""
-    common.git("fetch", "origin", common.MAIN_REFSPEC, timeout=15)
-    behind_ancestor = common.git("merge-base", "--is-ancestor", "HEAD", "origin/main", check=False).returncode == 0
-    dirty = common.git_out("status", "--porcelain", "--untracked-files=no")
-    if behind_ancestor and not dirty:
-        common.git("merge", "--ff-only", "origin/main")
-    # как в commit.py: git status облака видит ветку сессии вровень с main
-    common.set_upstream_main()
-    behind = int(common.git_out("rev-list", "--count", "HEAD..origin/main"))
+    behind = common.sync_main()
     if behind == 0:
         return "Копия базы обновлена до main"
     n = behind % 100
@@ -61,9 +55,7 @@ def now_line():
 
 
 def daily_line():
-    today = common.now().strftime("%Y-%m-%d")
-    rel = "%s/%s.md" % (common.REPORTS_DAILY, today)
-    return "Сводка за сегодня: %s" % rel if os.path.exists(common.path(rel)) else "Сводки за сегодня нет"
+    return deliver.status_line()
 
 
 def configured():

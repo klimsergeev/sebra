@@ -32,7 +32,7 @@ big_docs:
 
 language:
   main: "ru"
-  translate_quotes: true       # цитата не на русском — рядом перевод
+  translate_quotes: yes        # цитата не на русском — рядом перевод
 
 # Модели агентов: opus, sonnet, haiku или fable. Значение переносится в поле model файла агента.
 agents:
