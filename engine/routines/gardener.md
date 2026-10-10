@@ -4,7 +4,7 @@
 
 ## Поля формы
 
-Форма — https://claude.ai/code/routines → **New routine**. Поля — по одному, как их показывает `engine/SETUP.md`.
+Форма — https://claude.ai/code/routines → **New routine**. Все поля — одним сообщением, как их показывает `engine/SETUP.md`, шаг 6.
 
 | Поле формы | Что ввести |
 |------------|------------|

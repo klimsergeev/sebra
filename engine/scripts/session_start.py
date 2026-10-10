@@ -1,6 +1,10 @@
-"""Хук SessionStart: догоняет main, если копия чиста и отстаёт, и печатает 4–5 строк в контекст сессии.
+"""Хук SessionStart: запоминает версию движка сессии, догоняет main, если копия чиста и отстаёт, и печатает 4–5 строк
+в контекст сессии.
 
-python3 "$CLAUDE_PROJECT_DIR/engine/scripts/session_start.py" (вход — JSON хука в stdin, поле source).
+python3 "$CLAUDE_PROJECT_DIR/engine/scripts/session_start.py" (вход — JSON хука в stdin, поля source и session_id).
+
+Версия сессии — версия engine.lock до догона main: с ней Claude Code загрузил CLAUDE.md (при старте, возобновлении
+и после сжатия контекста); хук на сообщение сравнивает её с engine.lock.
 
 Код выхода всегда 0: от хука ничего не зависит, сбой пункта — строка «<пункт>: не удалось (<причина>)».
 """
@@ -14,12 +18,22 @@ import deliver
 from common import Fail
 
 
-def read_source():
+def read_input():
     try:
         data = json.loads(sys.stdin.read() or "{}")
-        return data.get("source", "") if isinstance(data, dict) else ""
     except ValueError:
-        return ""
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def remember_version(sid):
+    """Версия движка, с которой сессия загрузила CLAUDE.md; сбой — строка в stderr, в контекст ничего."""
+    try:
+        version = common.lock_version()
+        if version:
+            common.save_session(sid, {"version": version, "notice_for": "", "noticed": "", "prompts": 0})
+    except Exception as e:  # noqa: BLE001 — хук не падает
+        print("session_start.py: версия сессии не записана (%s)" % e, file=sys.stderr)
 
 
 def sync():
@@ -64,7 +78,9 @@ def configured():
 
 
 def main():
-    source = read_source()
+    inp = read_input()
+    source = inp.get("source", "")
+    remember_version(inp.get("session_id"))
     last = None
     if source in ("startup", "resume"):
         last = item("Копия базы", sync)

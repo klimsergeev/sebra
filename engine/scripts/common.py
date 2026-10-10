@@ -657,6 +657,50 @@ def engine_files():
     return set(str(f) for f in files)
 
 
+def lock_version():
+    """Версия из engine.lock; нет файла или поля — None."""
+    lock = engine_lock()
+    value = lock.get("version") if lock else None
+    return str(value) if value else None
+
+
+# Версия движка, с которой сессия загрузила CLAUDE.md: пишет хук SessionStart, читает хук UserPromptSubmit.
+SESSION_DIR = os.environ.get("SEBRA_SESSION_DIR") or "/tmp/sebra/session"
+_SESSION_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
+
+
+def session_file(sid):
+    """Файл сессии по session_id входа хука; id не годится для имени файла — None."""
+    if not isinstance(sid, str) or not _SESSION_ID.fullmatch(sid):
+        return None
+    return os.path.join(SESSION_DIR, sid + ".json")
+
+
+def load_session(sid):
+    """Словарь сессии или None: файла нет, он не читается или id не годится."""
+    p = session_file(sid)
+    if p is None:
+        return None
+    try:
+        with open(p, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def save_session(sid, data):
+    """Записать словарь сессии атомарно; id не годится — ничего."""
+    p = session_file(sid)
+    if p is None:
+        return
+    os.makedirs(SESSION_DIR, exist_ok=True)
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, p)
+
+
 def version_tuple(v):
     m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", str(v))
     if not m:

@@ -6,7 +6,9 @@ python3 engine/scripts/deliver.py shown [--live] [--json]   — сводку п�
 python3 engine/scripts/deliver.py send [--json]             — рутина: сообщение в основную сессию (claude -p --cloud)
 python3 engine/scripts/deliver.py status [--json]           — состояние сводки на сегодня
 
-Хуки: код выхода всегда 0; сбой — строка «deliver.py: …» в stderr, в контекст ничего.
+Хуки: код выхода всегда 0; сбой — строка «deliver.py: …» в stderr. hook-prompt собирает сводку дня и строку о версии
+движка (STALE_TEXT) порознь: сбой одной части не мешает другой, в контекст идёт уцелевшая; сбой обеих или всего хука
+(например, не прочитан JSON на входе) — в контекст ничего. hook-stop при сбое ничего не выводит.
 Остальные команды: 0 — сделано, 1 — правила или отказ получателя, 2 — вызов, 3 — окружение.
 """
 
@@ -34,6 +36,9 @@ LOG_DAYS = 60                           # сколько дней журнала
 MAX_CONTEXT = 9000                      # предел контекста хука — 10 000 знаков
 ROUTINE_PREFIX = "Выполни рутину "      # так начинается текст каждой рутины в форме
 DELIVERY_PREFIX = "Sebra: сводка дня за "  # так начинается сообщение, которое шлёт send
+STALE_TEXT = "Sebra: сессия начата на версии движка %s, в базе стоит %s."
+STALE_EVERY = _dt.timedelta(minutes=60)  # напоминание о старой версии — не чаще, если сообщений меньше STALE_PROMPTS
+STALE_PROMPTS = 10
 
 A_SESSION = "основная сессия"
 A_SHOWN = "сводка показана"
@@ -289,8 +294,71 @@ def routine_session(inp):
 def hook_prompt(inp):
     if routine_session(inp) or not configured():
         return None
+    try:
+        # common.now() — внутри try: испорченный config.yaml (нет пояса пользователя) роняет сводку, но не напоминание
+        summary = summary_context(inp, common.now())
+    except Exception as e:  # noqa: BLE001 — сбой сводки не мешает напоминанию о версии
+        print("deliver.py: %s" % (e.message if isinstance(e, Fail) else e), file=sys.stderr)
+        summary = None
+    try:
+        # после summary_context: догон main мог принести engine.lock новой версии
+        notice = stale_notice(inp.get("session_id"), stale_clock())
+    except Exception as e:  # noqa: BLE001 — напоминание не мешает сводке
+        print("deliver.py: версия сессии не сверена (%s)" % e, file=sys.stderr)
+        notice = None
+    text = "\n\n".join(p for p in (notice, summary) if p)
+    if not text:
+        return None
+    return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": text}}
+
+
+def stale_clock():
+    """Момент для частоты напоминания о версии — в UTC. Пояс пользователя нужен только чтобы прочесть SEBRA_NOW без
+    смещения; config.yaml не читается — пояс UTC, как collect.py при сломанных настройках берёт пояс по умолчанию."""
+    try:
+        moment = common.now()
+    except Exception:  # noqa: BLE001 — испорченный config.yaml, неизвестный пояс, нет базы поясов
+        common.use_timezone(_dt.timezone.utc)
+        moment = common.now()
+    return moment.astimezone(_dt.timezone.utc)
+
+
+def stale_notice(sid, moment):
+    """Строка для агента, если сессия загрузила CLAUDE.md другой версии, чем в engine.lock сейчас.
+
+    Первое сообщение после расхождения — строка; дальше — когда с прошлой прошло STALE_EVERY или STALE_PROMPTS
+    сообщений. Файла сессии нет (сессия начата до этой доработки или хук начала не записал) — он заводится с
+    текущей версией, без строки. moment — в UTC (stale_clock()); noticed в файле сессии — тоже UTC: поправка или
+    порча config.yaml между сообщениями не сдвигает отсчёт часа на разницу поясов.
+    """
+    current = common.lock_version()
+    if not current:
+        return None
+    rec = common.load_session(sid)
+    if rec is None:
+        common.save_session(sid, {"version": current, "notice_for": "", "noticed": "", "prompts": 0})
+        return None
+    loaded = str(rec.get("version") or "")
+    if not loaded or loaded == current:
+        return None
+    prompts = rec.get("prompts") if isinstance(rec.get("prompts"), int) else 0
+    try:
+        noticed = _dt.datetime.fromisoformat(str(rec.get("noticed"))).replace(tzinfo=moment.tzinfo)
+    except ValueError:
+        noticed = None
+    due = (rec.get("notice_for") != current or noticed is None or moment - noticed >= STALE_EVERY
+           or prompts + 1 >= STALE_PROMPTS)
+    if due:
+        rec.update(notice_for=current, noticed=common.fmt_dt(moment), prompts=0)
+    else:
+        rec["prompts"] = prompts + 1
+    common.save_session(sid, rec)
+    return STALE_TEXT % (loaded, current) if due else None
+
+
+def summary_context(inp, moment):
+    """Текст сводки дня для контекста хода или None."""
     delivery = is_delivery(inp.get("prompt"))
-    moment = common.now()
     day = moment.date()
     due = moment >= summary_moment(moment) and not shown_on(day)
     if due:
@@ -311,7 +379,7 @@ def hook_prompt(inp):
         return None
     text, snap = build(day, moment)
     save_snap(snap)
-    return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": text}}
+    return text
 
 
 # ---------------------------------------------------------------- хук Stop

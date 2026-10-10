@@ -34,6 +34,9 @@ language:
   main: "ru"
   translate_quotes: yes        # цитата не на русском — рядом перевод
 
+answers:
+  quotes: yes                  # дословные цитаты в ответах: yes — показывать, no — не показывать
+
 # Модели агентов: opus, sonnet, haiku или fable. Значение переносится в поле model файла агента.
 agents:
   intake: "opus"               # модель приёма присланного

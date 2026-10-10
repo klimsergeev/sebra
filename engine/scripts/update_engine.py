@@ -7,6 +7,8 @@ python3 engine/scripts/update_engine.py update [--to X.Y.Z] [--json]
 Версии — теги X.Y.Z репозитория движка (адрес — поле source в engine.lock). Код из клона не исполняется: клон
 только копируется; после копирования config.py, journal.py, commit.py и lint.py — уже файлы движка базы.
 Параметры вызовов config.py migrate и commit.py — постоянный договор: меняются только со сменой старшего номера.
+Обновление трогает файлы движка, config.yaml, engine.lock и журнал; несохранённые правки данных (data/, кроме журнала)
+остаются как есть и называются в ответе полем unsaved_data.
 """
 
 import argparse
@@ -27,6 +29,8 @@ GIT_ENV = {"GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C"}
 USER_FILES = (common.CONFIG, common.RULES, common.ENGINE_LOCK)
 WORKFLOWS = ".github/workflows/"
 LOCK_HEAD = "# Версия движка в этой базе. Пишет только engine/scripts/update_engine.py."
+UNSENT = ("в сессии есть неотправленные сохранения: сначала python3 engine/scripts/commit.py --who seb-update-engine "
+          "--message \"отправка перед обновлением\"")
 
 
 class Parser(argparse.ArgumentParser):
@@ -52,6 +56,47 @@ def git_any(*args, cwd=None, check=True, timeout=300):
 
 def user_path(p):
     return p in USER_FILES or p == common.DATA_DIR or p.startswith(common.DATA_DIR + "/")
+
+
+def in_log(p):
+    return p.startswith(common.LOG + "/")
+
+
+def data_change(p):
+    """Правка, которой обновление не касается: файл данных вне журнала."""
+    return p.startswith(common.DATA_DIR + "/") and not in_log(p)
+
+
+def status_paths():
+    """Пути с правками рабочей копии: изменённые, удалённые, добавленные в индекс, неотслеживаемые (каждый файл)."""
+    out = common.git("status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames").stdout
+    paths, parts, i = set(), out.split("\0"), 0
+    while i < len(parts):
+        entry = parts[i]
+        i += 1
+        if len(entry) < 4:
+            continue
+        if "R" in entry[:2] or "C" in entry[:2]:
+            i += 1  # у переименования следом идёт старое имя
+        paths.add(entry[3:])
+    return paths
+
+
+def check_worktree():
+    """Шаг 1: правки вне данных — отказ; несохранённый журнал — отказ с подсказкой отправить; правки данных
+    вне журнала — не мешают. Возвращает их пути."""
+    paths = status_paths()
+    other = sorted(p for p in paths if not data_change(p) and not in_log(p))
+    if other:
+        raise Fail(1, "в рабочей копии несохранённые правки: %s" % ", ".join(other))
+    if any(in_log(p) for p in paths):
+        raise Fail(1, UNSENT)
+    return sorted(p for p in paths if data_change(p))
+
+
+def unsaved_data():
+    """Пути несохранённых правок данных вне журнала — без отказов шага 1: для ответа «новой версии нет» до шага 1."""
+    return sorted(p for p in status_paths() if data_change(p))
 
 
 def remote_versions(source):
@@ -264,9 +309,10 @@ def choose_target(args, versions, installed):
     return target if target > installed else None
 
 
-def nothing_new(args, installed):
+def nothing_new(args, installed, left):
     say(args, {"from": vstr(installed), "to": vstr(installed), "replaced": [], "added": [], "deleted": [],
-               "config": None, "commit": "", "pushed": False, "lint": None}, "новой версии нет")
+               "config": None, "commit": "", "pushed": False, "lint": None, "unsaved_data": list(left)},
+        "новой версии нет")
     return 0
 
 
@@ -277,19 +323,15 @@ def cmd_update(args):
     versions = remote_versions(source)
     target = choose_target(args, versions, installed)
     if target is None:
-        return nothing_new(args, installed)
+        return nothing_new(args, installed, unsaved_data())
 
-    # 1) рабочая копия чистая (неотслеживаемые вне .gitignore — тоже правки)
-    dirty = common.git_out("status", "--porcelain", "--untracked-files=all")
-    if dirty:
-        raise Fail(1, "в рабочей копии несохранённые правки: %s" % ", ".join(
-            line[3:] for line in dirty.split("\n") if line.strip()))
+    # 1) правки вне данных — нет, журнал отправлен; правки данных вне журнала остаются как есть
+    left = check_worktree()
     # 2) копия вровень с main
     common.git("fetch", "origin", common.MAIN_REFSPEC, timeout=180)
     ahead = int(common.git_out("rev-list", "--count", "origin/main..HEAD") or 0)
     if ahead:
-        raise Fail(1, "в сессии есть неотправленные сохранения: сначала python3 engine/scripts/commit.py --who "
-                      "seb-update-engine --message \"отправка перед обновлением\"")
+        raise Fail(1, UNSENT)
     merged = common.git("merge", "--ff-only", "origin/main", check=False)
     if merged.returncode != 0:
         raise Fail(1, "копия не догнала main: %s" % common.git_error(merged))
@@ -298,17 +340,17 @@ def cmd_update(args):
     installed = common.version_tuple(lock["version"])
     target = choose_target(args, versions, installed)
     if target is None:
-        return nothing_new(args, installed)
+        return nothing_new(args, installed, left)
     old_files = [str(f) for f in lock["files"]]
     # 3) клон версии и его проверка
     tmp = clone(source, target)
     try:
-        return update_from_clone(args, lock, installed, target, versions, old_files, tmp)
+        return update_from_clone(args, lock, installed, target, versions, old_files, tmp, left)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def update_from_clone(args, lock, installed, target, versions, old_files, tmp):
+def update_from_clone(args, lock, installed, target, versions, old_files, tmp, left):
     head = git_any("rev-parse", "HEAD", cwd=tmp).stdout.strip()
     if head != versions[target]:
         raise Fail(1, "клон версии %s — не коммит её тега" % vstr(target))
@@ -391,7 +433,7 @@ def update_from_clone(args, lock, installed, target, versions, old_files, tmp):
                 raise Rollback("сохранение не прошло: %s" % ((saved or {}).get("error") or text))
     except BaseException as e:  # noqa: BLE001 — любой сбой после шага 6: база как до запуска
         reason = e.message if isinstance(e, Fail) else (str(e) or type(e).__name__)
-        problem = restore(before, old_files, new_files, journal_file or today_log)
+        problem = restore(before, old_files, new_files, journal_file or today_log, left)
         if isinstance(e, (KeyboardInterrupt, SystemExit)):
             raise
         if problem:
@@ -402,10 +444,13 @@ def update_from_clone(args, lock, installed, target, versions, old_files, tmp):
     code, lint, text = run_engine("lint.py", "--json")
     result = {"from": vstr(installed), "to": vstr(target), "replaced": replaced, "added": added,
               "deleted": deleted, "config": cfg, "commit": saved.get("commit", ""),
-              "pushed": saved.get("status") == "pushed", "lint": lint if lint is not None else {"error": text}}
+              "pushed": saved.get("status") == "pushed", "lint": lint if lint is not None else {"error": text},
+              "unsaved_data": left}
     say(args, result, "Движок: %s → %s; сохранено в main: %s" % (vstr(installed), vstr(target),
                                                                  saved.get("commit", "")[:7]))
     if not args.json:
+        if left:
+            print("Не тронуты несохранённые файлы данных: %s" % ", ".join(left))
         print("Начните новую сессию: новая версия загружается при старте сессии")
     return 0
 
@@ -420,8 +465,9 @@ def landed(before):
     return common.git("merge-base", "--is-ancestor", head, "origin/main", check=False).returncode == 0
 
 
-def restore(before, old_files, new_files, journal_file):
-    """Сбой после шага 6: база как до запуска. Возвращает "" или что осталось не так."""
+def restore(before, old_files, new_files, journal_file, left):
+    """Сбой после шага 6: база как до запуска. Возвращает "" или что осталось не так; правки данных из left были
+    до запуска и не в счёт."""
     try:
         _restore(before, old_files, new_files, journal_file)
     except Exception as e:  # noqa: BLE001 — откат доводится до проверки ниже
@@ -429,8 +475,8 @@ def restore(before, old_files, new_files, journal_file):
     head = common.git_out("rev-parse", "HEAD")
     if head != before:
         return "HEAD %s вместо %s" % (head[:7], before[:7])
-    dirty = common.git_out("status", "--porcelain", "--untracked-files=all")
-    return "в рабочей копии остались правки: %s" % dirty.replace("\n", "; ") if dirty else ""
+    dirty = sorted(status_paths() - set(left))
+    return "в рабочей копии остались правки: %s" % "; ".join(dirty) if dirty else ""
 
 
 def _restore(before, old_files, new_files, journal_file):

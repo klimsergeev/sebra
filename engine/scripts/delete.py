@@ -1,23 +1,34 @@
-"""Удаление файлов данных: один файл по просьбе пользователя или дубль, старые закрытые задачи. Коммит не делает.
+"""Удаление файлов данных: один файл по просьбе пользователя или дубль, старые закрытые задачи, черновики сессии.
+Коммит не делает.
 
 python3 engine/scripts/delete.py path <путь> --who <seb-restorer | seb-gardener> --reason "<причина>" [--dry-run] [--json]
 python3 engine/scripts/delete.py tasks --older <N> [--json]
+python3 engine/scripts/delete.py drafts [--json]
+python3 engine/scripts/delete.py draft <путь> --who seb-intake --reason "<причина>" [--json]
 
 Удалённые пути исполнитель передаёт commit.py со своим --who. Удаление — os.remove, не git rm.
 Ссылки на файл (referenced_by) — {"path", "line", "via"}: ссылки и поля record, project в data/wiki/, data/tasks/,
 data/index.md и строки data/reminders/ с этой записью (via reminder). data/reports/ и data/log/ не смотрятся.
+Черновик — несохранённая правка файла data/ вне журнала: new — файла нет в HEAD, changed — файл есть в HEAD и на
+диске и отличается, deleted — файл есть в HEAD, а на диске нет. draft берёт new и changed вне напоминаний: new
+убирает с диска и из индекса, changed возвращает на диске и в индексе к HEAD; нынешняя версия остаётся в
+/tmp/sebra/drafts/ до конца сессии; строку журнала «черновик убран» уносит следующий commit.py без путей.
 """
 
 import argparse
 import glob
 import json
 import os
+import shutil
 import sys
 
 import common
 from common import Fail
 
 DELETERS = ("seb-restorer", "seb-gardener")
+DRAFTERS = ("seb-intake",)
+DRAFT_COPIES = os.environ.get("SEBRA_DRAFTS_DIR") or "/tmp/sebra/drafts"  # переменная — для тестов
+A_DRAFT = "черновик убран"
 
 
 class Parser(argparse.ArgumentParser):
@@ -96,6 +107,123 @@ def cmd_path(args):
     return 0
 
 
+def in_head(rel):
+    return common.git("cat-file", "-e", "HEAD:%s" % rel, check=False).returncode == 0
+
+
+def draft_state(rel):
+    """Состояние несохранённой правки по HEAD и диску: new | changed | deleted."""
+    if not in_head(rel):
+        return "new"
+    return "changed" if os.path.lexists(common.path(rel)) else "deleted"
+
+
+def data_changes():
+    """Несохранённые правки data/ вне журнала: [(состояние, путь)] по порядку путей, каждый путь один раз."""
+    out = common.git("status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames", "--",
+                     common.DATA_DIR + "/").stdout
+    paths, parts, i = set(), out.split("\0"), 0
+    while i < len(parts):
+        entry = parts[i]
+        i += 1
+        if len(entry) < 4:
+            continue
+        if "R" in entry[:2] or "C" in entry[:2]:
+            i += 1  # у переименования следом идёт старое имя
+        if not entry[3:].startswith(common.LOG + "/"):
+            paths.add(entry[3:])
+    return [(draft_state(rel), rel) for rel in sorted(paths)]
+
+
+def saved_blobs():
+    """{хеш содержимого: [пути]} файлов data/ в HEAD."""
+    out = common.git("ls-tree", "-r", "-z", "HEAD", "--", common.DATA_DIR + "/").stdout
+    blobs = {}
+    for entry in out.split("\0"):
+        if "\t" not in entry:
+            continue
+        meta, rel = entry.split("\t", 1)
+        blobs.setdefault(meta.split()[2], []).append(rel)
+    return blobs
+
+
+def cmd_drafts(args):
+    common.ensure_repo()
+    blobs, out = None, []
+    for state, rel in data_changes():
+        same = ""
+        if state == "new" and os.path.isfile(common.path(rel)):
+            if blobs is None:
+                blobs = saved_blobs()
+            sha = common.git_out("hash-object", "--", rel)
+            same = sorted(blobs.get(sha, [""]))[0]
+        out.append({"path": rel, "state": state, "same_as": same})
+    if args.json:
+        print(json.dumps({"drafts": out}, ensure_ascii=False))
+    else:
+        for d in out:
+            print("%s — %s%s" % (d["path"], d["state"], (", как " + d["same_as"]) if d["same_as"] else ""))
+        if not out:
+            print("несохранённых правок данных нет")
+    return 0
+
+
+def copy_target(rel):
+    """Путь копии в папке копий; файл с тем же путём за ту же минуту не затирается."""
+    base = os.path.join(DRAFT_COPIES, common.now().strftime("%Y%m%d-%H%M"), rel)
+    copy, n = base, 1
+    while os.path.lexists(copy):
+        n += 1
+        copy = "%s.%d" % (base, n)
+    return copy
+
+
+def cmd_draft(args):
+    common.ensure_repo()
+    if args.who not in DRAFTERS:
+        raise Fail(2, "--who: черновики убирает только seb-intake, а не «%s»" % args.who)
+    rel = common.rel_path(args.path)
+    if rel is None or not rel.startswith(common.DATA_DIR + "/"):
+        raise Fail(1, "черновик — только файл data/: %s" % args.path)
+    if rel.startswith(common.LOG + "/"):
+        raise Fail(1, "журнал не удаляется: %s" % rel)
+    if rel.startswith(common.REMINDERS + "/"):
+        raise Fail(1, "напоминания убирает python3 engine/scripts/remind.py cancel: %s" % rel)
+    full = common.path(rel)
+    if os.path.isdir(full) and not os.path.islink(full):
+        raise Fail(2, "это папка, а не файл: %s" % rel)
+    state = dict((p, s) for s, p in data_changes()).get(rel)
+    if state is None:
+        if os.path.lexists(full):
+            raise Fail(1, "в %s нет несохранённых правок — убирать нечего" % rel)
+        raise Fail(2, "нет такого файла: %s" % rel)
+    if state == "deleted":
+        raise Fail(1, "%s сохранён в базе и удалён с диска — это не черновик; вернуть его — seb-restorer" % rel)
+    if not (args.reason or "").strip():
+        raise Fail(2, "--reason: нужна причина")
+    copy = copy_target(rel)
+    os.makedirs(os.path.dirname(copy), exist_ok=True)
+    shutil.copy2(full, copy, follow_symlinks=False)
+    if state == "changed":
+        back = common.git("restore", "--source=HEAD", "--staged", "--worktree", "--", rel, check=False)
+    else:
+        # -f: файл в индексе, потом ещё правленный, без него git rm отказывает; с --cached снимает только запись индекса
+        back = common.git("rm", "-q", "-f", "--cached", "--ignore-unmatch", "--", rel, check=False)
+        if back.returncode == 0:
+            os.remove(full)
+    if back.returncode != 0:
+        raise Fail(3, "черновик не убран, копия — %s: %s" % (copy, common.git_error(back)))
+    _, line = common.journal_add(args.who, A_DRAFT, rel, args.reason)
+    result = {"path": rel, "state": state, "copy": copy, "line": line}
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False))
+    elif state == "changed":
+        print("черновик убран: %s — как в базе; копия правки — %s" % (rel, copy))
+    else:
+        print("черновик убран: %s; копия — %s" % (rel, copy))
+    return 0
+
+
 def emit(args, result, text, stream=None):
     if args.json:
         print(json.dumps(result, ensure_ascii=False))
@@ -167,6 +295,13 @@ def main():
     s = sub.add_parser("tasks")
     s.add_argument("--older", required=True)
     s.add_argument("--json", action="store_true")
+    s = sub.add_parser("drafts")
+    s.add_argument("--json", action="store_true")
+    s = sub.add_parser("draft")
+    s.add_argument("path")
+    s.add_argument("--who", required=True)
+    s.add_argument("--reason")
+    s.add_argument("--json", action="store_true")
     for sp in sub.choices.values():
         sp.error = p.error
     args = p.parse_args()
@@ -174,7 +309,11 @@ def main():
         return cmd_path(args)
     if args.cmd == "tasks":
         return cmd_tasks(args)
-    raise Fail(2, "команда: path или tasks")
+    if args.cmd == "drafts":
+        return cmd_drafts(args)
+    if args.cmd == "draft":
+        return cmd_draft(args)
+    raise Fail(2, "команда: path, tasks, drafts или draft")
 
 
 if __name__ == "__main__":
