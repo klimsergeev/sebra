@@ -26,6 +26,8 @@ CONFIG = "config.yaml"
 CONFIG_DEFAULT = "engine/config.default.yaml"
 ENGINE_LOCK = "engine.lock"
 RULES = "rules.local.md"
+VIEWS = "views.yaml"
+VIEWS_DEFAULT = "engine/views.default.yaml"
 AGENTS_DIR = ".claude/agents"
 
 RECORDS = "data/records"
@@ -563,6 +565,15 @@ def git_out(*args, **kw):
     return git(*args, **kw).stdout.strip()
 
 
+def in_head(rel, timeout=120):
+    """Путь rel есть в HEAD: True или False. Нет репозитория или HEAD, git не ответил за timeout — Fail(3).
+
+    Один git cat-file -e не различает «пути нет в HEAD» и «git не работает»: сначала проверяется сам HEAD.
+    """
+    git("rev-parse", "--verify", "-q", "HEAD^{commit}", timeout=timeout)
+    return git("cat-file", "-e", "HEAD:%s" % rel, check=False, timeout=timeout).returncode == 0
+
+
 def ensure_repo():
     cp = git("rev-parse", "--is-inside-work-tree", check=False)
     if cp.returncode != 0 or cp.stdout.strip() != "true":
@@ -775,6 +786,24 @@ CODE_SPAN = re.compile(r"(`+).+?\1")
 SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 LINK_DEF = re.compile(r"^ {0,3}\[[^\]]+\]:")
 REMINDER_RE = re.compile(r"^- (?P<text>\S.*?) — \[запись\]\(\.\./records/(?P<rec>[^()\s<>/]+\.md)\)$")
+# Хвост напоминания прошлого дня в сводке и её показе: перед тире и после «с» — неразрывные пробелы (formats.md,
+# «Ежедневная сводка»). Строят deliver.py и lint.py, снимают — при сравнении строк напоминаний.
+NBSP = chr(0x00A0)                                  # неразрывный пробел
+REMINDER_LEFT = NBSP + "— осталось с" + NBSP + "%s"   # %s — ДД.ММ дня напоминания
+_REMINDER_TAILS = re.compile(r"(?:[ %s]— осталось с[ %s]\d{2}\.\d{2}| \(за прошлый день \d{2}\.\d{2}\))$" % (NBSP, NBSP))
+
+
+def reminder_left(day):
+    """Хвост напоминания, оставшегося с дня day (date)."""
+    return REMINDER_LEFT % day.strftime("%d.%m")
+
+
+def reminder_key(text):
+    """Текст напоминания для сравнения: без хвоста прошлого дня (нынешнего или сводок до 0.2.2), неразрывный пробел —
+    обычный, без пробелов по краям."""
+    return _REMINDER_TAILS.sub("", text.rstrip()).replace(NBSP, " ").strip()
+
+
 FACT_LINE = re.compile(r"^- \*\*(\d{4}-\d{2}-\d{2})\*\* — ")
 PATH_FIELDS = ("record", "project")
 _HEADER_PATH = re.compile(r'^(record|project):[ \t]*"([^"]*)"[ \t]*$')

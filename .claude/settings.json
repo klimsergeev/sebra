@@ -3,7 +3,7 @@
     "deny": [
       "Edit(/README.md)", "Edit(/CLAUDE.md)", "Edit(/.gitattributes)", "Edit(/.gitignore)",
       "Edit(/.claude/**)", "Edit(/.github/**)", "Edit(/.git/**)", "Edit(/engine/**)",
-      "Edit(/engine.lock)", "Edit(/config.yaml)", "Edit(/data/log/**)", "Edit(/data/reminders/**)",
+      "Edit(/engine.lock)", "Edit(/config.yaml)", "Edit(/views.yaml)", "Edit(/data/log/**)", "Edit(/data/reminders/**)",
       "NotebookEdit", "Monitor", "Agent(fork)", "Agent(model:*)",
       "Bash(rm *)", "Bash(rmdir *)", "Bash(unlink *)", "Bash(mv *)", "Bash(find *-delete*)",
       "Bash(git push *)", "Bash(git commit *)", "Bash(git add *)", "Bash(git rm *)", "Bash(git mv *)",

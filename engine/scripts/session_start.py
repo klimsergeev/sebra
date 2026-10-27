@@ -1,4 +1,4 @@
-"""Хук SessionStart: запоминает версию движка сессии, догоняет main, если копия чиста и отстаёт, и печатает 4–5 строк
+"""Хук SessionStart: запоминает версию движка сессии, догоняет main, если копия чиста и отстаёт, и печатает 4–6 строк
 в контекст сессии.
 
 python3 "$CLAUDE_PROJECT_DIR/engine/scripts/session_start.py" (вход — JSON хука в stdin, поля source и session_id).
@@ -15,6 +15,7 @@ import sys
 
 import common
 import deliver
+import views
 from common import Fail
 
 
@@ -77,6 +78,17 @@ def configured():
     return os.path.exists(common.path(common.CONFIG)) and os.path.exists(common.path(common.ENGINE_LOCK))
 
 
+def rules_line():
+    """Строка о разовом переносе правил о виде после обновления движка; переносить нечего или проверка не удалась —
+    None (сбой — в stderr: строка без смысла в контексте хуже, чем её отсутствие — перенос предложится позже)."""
+    try:
+        if configured() and views.rules_state()["pending"]:
+            return views.RULES_TEXT
+    except Exception as e:  # noqa: BLE001 — хук не падает
+        print("session_start.py: перенос правил о виде не проверен (%s)" % e, file=sys.stderr)
+    return None
+
+
 def main():
     inp = read_input()
     source = inp.get("source", "")
@@ -90,6 +102,9 @@ def main():
         item("Сейчас у пользователя", now_line),
         item("Сводка за сегодня", daily_line),
     ]
+    rules = rules_line()
+    if rules:
+        lines.append(rules)
     if last:
         lines.append(last)
     print("\n".join(lines))

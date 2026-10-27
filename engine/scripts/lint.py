@@ -1,4 +1,4 @@
-"""Проверка базы: форматы файлов данных, настроек и engine.lock. Только читает.
+"""Проверка базы: форматы файлов данных, настроек, вида сводки и engine.lock. Только читает.
 
 python3 engine/scripts/lint.py [--json] [пути…]
 
@@ -15,13 +15,15 @@ import subprocess
 import sys
 
 import common
+import remind
+import views
 from common import Fail, UniqueKeyLoader
 
 import yaml
 
 # ---------------------------------------------------------------- раскладка
 
-ROOT_OWN = (common.CONFIG, common.RULES, common.ENGINE_LOCK)
+ROOT_OWN = (common.CONFIG, common.VIEWS, common.RULES, common.ENGINE_LOCK)
 INDEX = common.INDEX
 DATA_SUBDIRS = ("records", "wiki", "tasks", "reminders", "reports", "log")
 NESTED = {"wiki": ("topics", "people", "projects", "sources"), "reports": ("daily", "weekly")}
@@ -60,9 +62,15 @@ SECTIONS = {
     "index": ["Темы", "Люди", "Проекты", "Источники (последние 30)"],
     "rules": ["Кто я", "Правила"],
 }
-DAILY_SUB = ["Просрочено", "На сегодня", "Зависшие", "В работе", "Ждёт ответа"]
+# «Напоминания» и «Дела на день» — группы «### » по виду сводки, в «Делах на день» ещё категории «#### » (formats.md).
+GROUPED = ("Напоминания", "Дела на день")
+HEADING = re.compile(r"^(?P<marks>#{3,}) (?P<title>.*)$")
+# Строка пустого раздела и группы: «Нет» — нынешняя, «нет» — сводок до 0.2.2; обе верны у любой сводки.
+NONE_LINES = ("Нет", "нет")
 UPDATE = re.compile(r"^Обновление ((?:[01]\d|2[0-3]):[0-5]\d)$")
-EMPTY_DAY = "Дел нет, ничего не менялось, зависших задач нет"
+# Строка пустого дня: нынешняя (formats.md, «Ежедневная сводка») и сводок до 0.2.2; неразрывный пробел равен обычному.
+EMPTY_DAYS = ("Сегодня пусто: ни дел, ни напоминаний. Садовник ничего не менял",
+              "Дел нет, ничего не менялось, зависших задач нет")
 REPORT_KINDS = ("daily", "weekly")
 
 # ---------------------------------------------------------------- строки тела
@@ -125,6 +133,11 @@ def day(text):
 def short(text, limit=60):
     text = text.strip()
     return text if len(text) <= limit else text[:limit] + "…"
+
+
+def plain(text):
+    """Строка для сравнения: неразрывный пробел — обычный, без пробелов по краям."""
+    return text.replace(common.NBSP, " ").strip()
 
 
 def normalize_quote(text):
@@ -322,6 +335,7 @@ class Lint:
         self._translate = None
         self._pending_records = []
         self._in_head = set()
+        self._saved = None
 
     # ---------------------------------------------------------- общее
 
@@ -375,6 +389,8 @@ class Lint:
             return "rules"
         if rel == common.CONFIG:
             return "config"
+        if rel == common.VIEWS:
+            return "views"
         if rel == common.ENGINE_LOCK:
             return "engine"
         folder, name = os.path.split(rel)
@@ -520,6 +536,9 @@ class Lint:
         if kind == "config":
             self.check_config(text)
             return
+        if kind == "views":
+            self.check_views(text)
+            return
         if kind == "reminder":
             self.check_reminder(rel, text)
             return
@@ -541,6 +560,9 @@ class Lint:
             self.check_links(rel, body, offset, full=False)
         self.check_sections(rel, kind, body, offset)
         self.check_items(rel, kind, body, offset, fields)
+        # имя не по формату папки — уже нарушение name: такой файл не сводка дня, вид с ним не сверяется
+        if kind == "daily" and "date" in fields and name_match is not None:
+            self.check_daily_view(rel, body, offset, fields["date"])
         if kind in PAGE_KINDS:
             self.check_facts(rel, kind, body, offset)
         if kind == "index":
@@ -783,19 +805,19 @@ class Lint:
             self.check_update(rel, n, lines)
         head_lines = [line for _, line, _ in blocks[0][2] if line.strip()]
         if kind == "daily" and not regular:
-            if head_lines != [EMPTY_DAY]:
-                self.add(rel, "sections", "нет разделов: нужны разделы сводки или одна строка «%s»" % EMPTY_DAY)
+            if len(head_lines) != 1 or plain(head_lines[0]) not in EMPTY_DAYS:
+                self.add(rel, "sections", "нет разделов: нужны разделы сводки или одна строка «%s»" % EMPTY_DAYS[0])
             return
         self.check_order(rel, [(n, t) for n, t, _ in regular], SECTIONS[kind])
         if kind == "daily":
             for n, line, code in common.lines_outside_code(body):
-                if not code and line.strip() == EMPTY_DAY:
+                if not code and plain(line) in EMPTY_DAYS:
                     self.add(rel, "sections", "строка %d: строка пустого дня рядом с разделами" % (n + offset))
         for n, title, lines in regular:
-            if kind == "daily" and title == "Дела на день":
-                self.check_daily_tasks_sections(rel, n, lines)
+            if kind == "daily" and title in GROUPED:
+                self.check_daily_block(rel, n, title, lines)
             elif not any(line.strip() for _, line, _ in lines):
-                self.add(rel, "sections", "строка %d: пустой раздел «## %s» — нужна строка «нет»" % (n, title))
+                self.add(rel, "sections", "строка %d: пустой раздел «## %s» — нужна строка «Нет»" % (n, title))
 
     def check_update(self, rel, n, lines):
         items = 0
@@ -813,18 +835,313 @@ class Lint:
         if not items:
             self.add(rel, "sections", "строка %d: пустое «Обновление»" % n)
 
-    def check_daily_tasks_sections(self, rel, n, lines):
-        subs, cur = [], None
-        for m, line, code in lines:
-            if not code and line.startswith("### "):
-                cur = (m, line[4:].strip(), [])
-                subs.append(cur)
-            elif cur is not None:
-                cur[2].append(line)
-        self.check_order(rel, [(m, t) for m, t, _ in subs], DAILY_SUB, mark="###")
-        for m, title, sub in subs:
-            if not any(x.strip() for x in sub):
-                self.add(rel, "sections", "строка %d: пустой подраздел «### %s» — нужна строка «нет»" % (m, title))
+    # ---------------------------------------------------------- сводка: группы, категории, вид
+
+    @staticmethod
+    def outline(lines):
+        """Раздел сводки по заголовкам «### » и «#### »: (строки до первой группы, группы, лишние заголовки).
+
+        lines — [(номер, строка, в коде?)] из blocks; строки блоков кода пропускаются. Группа — {"n", "title", "lines",
+        "cats"}: lines — строки прямо под «### » до первого «#### », cats — категории {"n", "title", "lines"}.
+        Лишние — [(номер, решётки, название)]: «#####» и глубже, «####» до первого «###».
+        """
+        loose, groups, odd = [], [], []
+        target = loose
+        for n, line, code in lines:
+            if code:
+                continue
+            m = HEADING.match(line)
+            if not m:
+                target.append((n, line))
+                continue
+            marks, title = m.group("marks"), m.group("title").strip()
+            if marks == "###":
+                groups.append({"n": n, "title": title, "lines": [], "cats": []})
+                target = groups[-1]["lines"]
+            elif marks == "####" and groups:
+                cat = {"n": n, "title": title, "lines": []}
+                groups[-1]["cats"].append(cat)
+                target = cat["lines"]
+            else:
+                odd.append((n, marks, title))
+        return loose, groups, odd
+
+    def check_daily_block(self, rel, n, title, lines):
+        """Форма «Напоминаний» и «Дел на день» любой сводки (formats.md, «Ежедневная сводка»): группы «### », в «Делах
+        на день» — категории «#### » внутри групп; названия непустые, без повторов; пустое — строка «Нет» или «нет»."""
+        def bad(m, message):
+            self.add(rel, "sections", "строка %d: %s" % (m, message))
+
+        tasks = title == "Дела на день"
+        loose, groups, odd = self.outline(lines)
+        for m, marks, name in odd:
+            if marks == "####":
+                bad(m, "«#### %s» до первой группы «###»: категория — только внутри группы" % name)
+            else:
+                bad(m, "заголовок «%s %s»: в «%s» — только %s" % (
+                    marks, name, title, "группы «### » и категории «#### »" if tasks else "группы «### »"))
+        if not groups and not any(x.strip() for _, x in loose):
+            if not odd:
+                bad(n, "пустой раздел «## %s» — нужна строка «Нет»" % title)
+            return
+        if tasks:
+            for m, x in loose:
+                if DAILY_TASK.match(x):
+                    bad(m, "задача до первой группы: задача стоит под заголовком группы «### »")
+                elif x.strip() in NONE_LINES and groups:
+                    bad(m, "«Нет» рядом с группами: «Нет» — только в пустом разделе или под пустой группой")
+        names = set()
+        for g in groups:
+            if not g["title"]:
+                bad(g["n"], "у группы «###» нет названия")
+            elif g["title"] in names:
+                bad(g["n"], "группа «### %s» повторяется" % g["title"])
+            names.add(g["title"])
+            direct = [(m, x) for m, x in g["lines"] if x.strip()]
+            if not tasks:
+                for c in g["cats"]:
+                    bad(c["n"], "«#### %s» в «Напоминаниях»: здесь только группы «### »" % c["title"])
+                if not direct and not g["cats"]:
+                    bad(g["n"], "пустая группа «### %s» — нужна строка «Нет»" % g["title"])
+                continue
+            if not g["cats"]:
+                if not direct:
+                    bad(g["n"], "пустая группа «### %s» — нужна строка «Нет»" % g["title"])
+                continue
+            for m, _ in direct:
+                bad(m, "в группе «### %s» есть категории: строки — только под «#### »" % g["title"])
+            cats = set()
+            for c in g["cats"]:
+                if not c["title"]:
+                    bad(c["n"], "у категории «####» нет названия")
+                elif c["title"] in cats:
+                    bad(c["n"], "категория «#### %s» повторяется в «### %s»" % (c["title"], g["title"]))
+                cats.add(c["title"])
+                if not any(DAILY_TASK.match(x) for _, x in c["lines"]):
+                    bad(c["n"], "категория «#### %s» без задач: категория без задач не пишется" % c["title"])
+
+    def saved(self, rel):
+        """Файл сводки есть в HEAD — сохранён. Нет HEAD или git ошибся — тоже «сохранён»: такую сводку проверяют только
+        по форме, без ложных нарушений view. Тот же смысл, что у common.in_head, — одним вызовом git на всю проверку."""
+        if self._saved is None:
+            try:
+                self.git("rev-parse", "--verify", "-q", "HEAD^{commit}")
+                out = self.git("ls-tree", "-r", "-z", "--name-only", "HEAD", "--", common.REPORTS_DAILY + "/").stdout
+                self._saved = (True, {p for p in out.split("\0") if p})
+            except Fail:
+                self._saved = (False, set())
+        head_ok, paths = self._saved
+        return not head_ok or rel in paths
+
+    def day_facts(self, today):
+        """Что видит collect.py daily на день today: {"tasks": [(путь, шапка открытой задачи)], "reminders": [строка
+        напоминания в сводке], "stuck": tasks.stuck_after_days}.
+
+        Строка напоминания — «- <текст>», прошлого дня — с хвостом common.reminder_left, как у deliver.py.
+        Файл задачи не читается или статус не из формата — ValueError: collect.py тогда тоже не отдал бы задач.
+        """
+        try:
+            cfg = common.config()
+        except Fail:
+            cfg = common.defaults()
+        tasks = []
+        folder = self.abs(common.TASKS)
+        names = sorted(x for x in os.listdir(folder) if x.endswith(".md") and not x.startswith(".")) \
+            if os.path.isdir(folder) else []
+        for name in names:
+            path = "%s/%s" % (common.TASKS, name)
+            text = self.text_of(path)
+            if text is None:
+                raise ValueError("%s не читается" % path)
+            header = common.front_matter(text)
+            if header.get("status") not in TASK_STATUSES:
+                raise ValueError("%s: status %r" % (path, header.get("status")))
+            if header["status"] in views.OPEN:
+                tasks.append((path, header))
+        reminders = []
+        files, _ = remind.day_files(today)
+        for when, path in files:
+            try:
+                lines = remind.read_lines(path) or []
+            except (OSError, UnicodeDecodeError):
+                continue
+            for line in lines:
+                m = common.REMINDER_RE.match(line)
+                if m:
+                    tail = common.reminder_left(when) if when < today else ""
+                    reminders.append("- %s%s" % (m.group("text"), tail))
+        return {"tasks": tasks, "reminders": reminders, "stuck": cfg["tasks.stuck_after_days"]}
+
+    def check_daily_view(self, rel, body, offset, date):
+        """Новая, ещё не сохранённая сводка — ещё и по виду на день своей шапки (formats.md, «Ежедневная сводка»).
+
+        Сходится со своим видом пользователя или с видом по умолчанию (запасной ход seb-reporter) — нарушений нет;
+        ни с каким — нарушения view по своему виду. Сохранённую — только по форме: вид мог смениться после неё.
+        Вид по умолчанию, задачи или настройки не читаются — сводка в unchecked с причиной, а не нарушение.
+        """
+        if self.saved(rel):
+            return
+        try:
+            today = day(date)
+            facts = self.day_facts(today)
+            view, source, _ = views.load()
+            candidates = [view] if source == "default" else [view, views.load_default()]
+            found = [self.view_problems(rel, body, offset, v, facts, today) for v in candidates]
+        except (Fail, ValueError, TypeError, KeyError, OSError) as e:
+            self.unchecked.append({"path": rel, "rule": "view",
+                                   "message": "по виду сводки: %s" % (getattr(e, "message", None) or e)})
+            return
+        if all(found):
+            for message in found[0]:
+                self.add(rel, "view", message)
+
+    def view_problems(self, rel, body, offset, view, facts, today):
+        """Нарушения сводки по виду view (проверенному, у групп есть if_empty); [] — сходится."""
+        fit = {path: views.task_groups(view["tasks"], header, today, facts["stuck"]) for path, header in facts["tasks"]}
+        blocks = self.blocks(body, offset)[1:]
+        if not blocks:
+            shown = sorted(p for p, groups in fit.items() if self.strict_groups(view["tasks"]["groups"], groups))
+            if not facts["reminders"] and not shown:
+                return []
+            return ["пустой день, а на %s по виду есть напоминаний — %d, задач в группах — %d%s" % (
+                today.strftime("%d.%m"), len(facts["reminders"]), len(shown), ": " + ", ".join(shown) if shown else "")]
+        sections = {}
+        for _, title, lines in blocks:
+            sections.setdefault(title, lines)
+        out = []
+        if "Напоминания" in sections:
+            out += self.reminder_view_problems(sections["Напоминания"], view["reminders"], facts["reminders"])
+        if "Дела на день" in sections:
+            out += self.task_view_problems(rel, sections["Дела на день"], view["tasks"], fit)
+        return out
+
+    @staticmethod
+    def strict_groups(spec, titles):
+        """Группы из titles без about: в них задача стоит по условиям, без решения по смыслу."""
+        about = {g["title"] for g in spec if "about" in g}
+        return [t for t in titles if t not in about]
+
+    @staticmethod
+    def heads_problems(groups, spec, title):
+        """Заголовки групп раздела title против групп вида spec: только группы вида, в его порядке; группа с
+        if_empty: show есть всегда; пустой группы с if_empty: hide в сводке нет."""
+        out = []
+        order = {g["title"]: i for i, g in enumerate(spec)}
+        names = ", ".join("«%s»" % g["title"] for g in spec) or "нет"
+        last = -1
+        for g in groups:
+            i = order.get(g["title"])
+            if i is None:
+                out.append("строка %d: «### %s» — не группа вида; группы «%s» по виду: %s"
+                           % (g["n"], g["title"], title, names))
+                continue
+            if i < last:
+                out.append("строка %d: группа «### %s» не по порядку вида: %s" % (g["n"], g["title"], names))
+            last = max(last, i)
+            if spec[i]["if_empty"] == "hide" and any(x.strip() in NONE_LINES for _, x in g["lines"]):
+                out.append("строка %d: группа «### %s» пустая, а в виде if_empty: hide — пустую группу не пишут"
+                           % (g["n"], g["title"]))
+        present = {g["title"] for g in groups}
+        for g in spec:
+            if g["if_empty"] == "show" and g["title"] not in present:
+                out.append("нет группы «### %s» в «%s»: по виду она есть всегда, пустая — со строкой «Нет»"
+                           % (g["title"], title))
+        return out
+
+    def task_view_problems(self, rel, lines, spec, fit):
+        """«Дела на день» по разделу tasks вида: группы, категории split, какие задачи в каких группах."""
+        _, groups, _ = self.outline(lines)
+        out = self.heads_problems(groups, spec["groups"], "Дела на день")
+        by_title = {g["title"]: g for g in spec["groups"]}
+        order = [g["title"] for g in spec["groups"]]
+        placed = {}
+        for g in groups:
+            group = by_title.get(g["title"])
+            if group is None:
+                continue
+            if g["cats"] and "split" not in group:
+                c = g["cats"][0]
+                out.append("строка %d: «#### %s» — у группы «### %s» в виде нет split, категорий нет"
+                           % (c["n"], c["title"], g["title"]))
+            elif "split" in group:
+                allowed = group["split"] + [views.OTHER]
+                if any(DAILY_TASK.match(x) for _, x in g["lines"]):
+                    out.append("строка %d: у группы «### %s» в виде split — задачи только по категориям «#### »"
+                               % (g["n"], g["title"]))
+                last = -1
+                for c in g["cats"]:
+                    if c["title"] not in allowed:
+                        out.append("строка %d: «#### %s» — не категория вида; категории «### %s»: %s"
+                                   % (c["n"], c["title"], g["title"], ", ".join(allowed)))
+                        continue
+                    if allowed.index(c["title"]) < last:
+                        out.append("строка %d: категория «#### %s» не по порядку split" % (c["n"], c["title"]))
+                    last = max(last, allowed.index(c["title"]))
+            for n, x in g["lines"] + [item for c in g["cats"] for item in c["lines"]]:
+                m = DAILY_TASK.match(x)
+                if m:
+                    placed.setdefault(resolve(rel, m.group("target")), []).append((n, g["title"]))
+        each = spec["each_task"]
+        for path, spots in sorted(placed.items()):
+            if path not in fit:
+                out += ["строка %d: %s — не открытая задача: в «Делах на день» только открытые" % (n, path)
+                        for n, _ in spots]
+                continue
+            fits = fit[path]
+            for n, title in spots:
+                if title not in fits:
+                    out.append("строка %d: задача %s не подходит условиям группы «%s» (подходят: %s)"
+                               % (n, path, title, ", ".join(fits) or "никакие"))
+            if each == "first_group":
+                if len(spots) > 1:
+                    out.append("строка %d: задача %s стоит %d раз, а при first_group — в одной группе"
+                               % (spots[1][0], path, len(spots)))
+                strict = self.strict_groups(spec["groups"], fits)
+                for n, title in spots:
+                    if strict and title in fits and order.index(title) > order.index(strict[0]):
+                        out.append("строка %d: задача %s в «%s», а при first_group её место не дальше «%s»"
+                                   % (n, path, title, strict[0]))
+            else:
+                seen = set()
+                for n, title in spots:
+                    if title in seen:
+                        out.append("строка %d: задача %s в группе «%s» дважды" % (n, path, title))
+                    seen.add(title)
+        for path in sorted(fit):
+            strict = self.strict_groups(spec["groups"], fit[path])
+            have = {title for _, title in placed.get(path, [])}
+            if each == "every_group":
+                out += ["нет задачи %s в группе «%s»: она подходит условиям группы" % (path, t)
+                        for t in strict if t not in have]
+            elif strict and not have:
+                out.append("нет задачи %s: при first_group она стоит в первой подходящей группе — «%s» или раньше, "
+                           "в группе с about" % (path, strict[0]))
+        return out
+
+    def reminder_view_problems(self, lines, spec, wanted):
+        """«Напоминания» по разделу reminders вида: группы и каждое текущее напоминание ровно один раз."""
+        loose, groups, _ = self.outline(lines)
+        out = self.heads_problems(groups, spec["groups"], "Напоминания")
+        need, got = {}, {}
+        for line in wanted:
+            need[plain(line)] = need.get(plain(line), 0) + 1
+        rows = loose + [item for g in groups for item in g["lines"] + [i for c in g["cats"] for i in c["lines"]]]
+        for n, x in rows:
+            line = plain(x)
+            if not line or line in NONE_LINES:
+                continue
+            if line not in need:
+                out.append("строка %d: «%s» — не напоминание на этот день; напоминание — «- <текст>», прошлого дня — "
+                           "«- <текст> — осталось с ДД.ММ»" % (n, short(line)))
+                continue
+            got[line] = got.get(line, 0) + 1
+        for line, k in need.items():
+            have = got.get(line, 0)
+            if have < k:
+                out.append("нет напоминания «%s»" % short(line))
+            elif have > k:
+                out.append("напоминание «%s» стоит %d раз — каждое ровно один раз" % (short(line), have))
+        return out
 
     # ---------------------------------------------------------- пункты
 
@@ -859,7 +1176,7 @@ class Lint:
             self.check_report_text(rel, body, offset)
         if kind == "daily" and "Дела на день" in sections:
             for n, line, code in sections["Дела на день"]:
-                if code or not line.strip() or line.startswith("### ") or line.strip() == "нет":
+                if code or not line.strip() or HEADING.match(line) or line.strip() in NONE_LINES:
                     continue
                 m = DAILY_TASK.match(line)
                 if not m or not in_folder(resolve(rel, m.group("target")), common.TASKS):
@@ -1278,6 +1595,23 @@ class Lint:
                     self.add(rel, "config", "строка %d не как в engine/config.default.yaml (отличаться может только "
                                             "значение): «%s»" % (n + 1, short(got[n] if n < len(got) else "")))
         self.check_agent_models(values)
+
+    def check_views(self, text):
+        """views.yaml: формат — таблица formats.md, раздел «Вид сводки и списка дел»; текст — тот, что пишет views.py."""
+        rel = common.VIEWS
+        data, errors = views.parse(text, rel)
+        if not errors:
+            errors = views.check(data, user=True)
+        for err in errors:
+            self.add(rel, "view", err)
+        if errors:
+            return
+        expected = views.render(data)
+        if expected != text:
+            got, want = text.split("\n"), expected.split("\n")
+            n = next((i for i, (a, b) in enumerate(zip(got, want)) if a != b), min(len(got), len(want)))
+            self.add(rel, "view", "не в том виде, в каком его пишет views.py (python3 engine/scripts/views.py set): "
+                                  "строка %d — «%s»" % (n + 1, short(got[n] if n < len(got) else "")))
 
     @staticmethod
     def bool_word_key(line, n, values, defaults):

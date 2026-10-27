@@ -23,6 +23,7 @@ import sys
 
 import common
 import remind
+import views
 from common import Fail
 
 DELIVER_DIR = os.environ.get("SEBRA_DELIVER_DIR") or "/tmp/sebra/deliver"
@@ -46,6 +47,7 @@ A_SENT = "сводка отправлена в сессию"
 A_NOT_SENT = "сводка не отправлена в сессию"
 LINK = re.compile(r"\[([^\]]+)\]\([^()\s<>]+\)")
 DAY_FILE = re.compile(r"^(\d{4}-\d{2}-\d{2})\.md$")
+NONE_TEXT = "Нет"                       # пустой раздел и пустая группа в показе (текст владельца 27.10)
 
 
 class Parser(argparse.ArgumentParser):
@@ -153,14 +155,66 @@ def is_delivery(prompt):
 # ---------------------------------------------------------------- текст сводки
 
 
-def render_reminders(items):
-    if not items:
-        return "нет"
+def reminder_lines(items):
+    """Строки напоминаний: сегодняшние, затем оставшиеся с прошлых дней с хвостом common.REMINDER_LEFT."""
     lines = []
-    for r in sorted(items, key=lambda r: r["overdue"]):  # formats.md: сегодняшние, затем «за прошлый день»
-        tail = " (за прошлый день %s)" % ddmm(common.parse_day(r["date"])) if r["overdue"] else ""
+    for r in sorted(items, key=lambda r: r["overdue"]):
+        tail = common.reminder_left(common.parse_day(r["date"])) if r["overdue"] else ""
         lines.append("- %s%s" % (r["text"], tail))
-    return "\n".join(lines)
+    return lines
+
+
+def reminder_groups(text):
+    """Группы «## Напоминаний» файла сводки по порядку файла: [(название, {ключи напоминаний под ним})].
+
+    В разделе нет строк «### » — []. Одно название дважды — одна группа; ключ — common.reminder_key: без хвоста
+    прошлого дня, неразрывный пробел — обычный.
+    """
+    groups = []
+    current = None
+    for _, line in common.section_lines(text, "Напоминания"):
+        if line.startswith("### "):
+            title = line[4:].strip()
+            current = next((g for g in groups if g[0] == title), None)
+            if current is None:
+                current = (title, set())
+                groups.append(current)
+        elif current is not None and line.startswith("- "):
+            current[1].add(common.reminder_key(line[2:]))
+    return groups
+
+
+def hidden_groups():
+    """Названия групп напоминаний нынешнего вида с if_empty: hide; вид не читается — пусто: группы — как в файле."""
+    try:
+        view, _, _ = views.load()
+    except Exception:  # noqa: BLE001 — показ сводки не зависит от того, прочитался ли вид
+        return set()
+    return {g["title"] for g in view["reminders"]["groups"] if g["if_empty"] == "hide"}
+
+
+def render_reminders(items, groups=(), hidden=()):
+    """Раздел «Напоминания» показа. Без групп — список; с группами файла сводки — напоминания вне групп списком без
+    заголовка, затем группы файла по порядку, напоминание — в первой группе, где стоит его текст. Группа без текущих
+    напоминаний — «Нет», а если она в hidden (в нынешнем виде у неё if_empty: hide) — её нет. Текущих напоминаний нет
+    совсем — «Нет»."""
+    if not items:
+        return NONE_TEXT
+    if not groups:
+        return "\n".join(reminder_lines(items))
+    placed = {title: [] for title, _ in groups}
+    loose = []
+    for r in items:
+        key = common.reminder_key(r["text"])
+        title = next((t for t, keys in groups if key in keys), None)
+        (loose if title is None else placed[title]).append(r)
+    parts = ["\n".join(reminder_lines(loose))] if loose else []
+    for title, _ in groups:
+        if placed[title]:
+            parts.append("### %s\n%s" % (title, "\n".join(reminder_lines(placed[title]))))
+        elif title not in hidden:
+            parts.append("### %s\n%s" % (title, NONE_TEXT))
+    return "\n\n".join(parts)
 
 
 def render_daily(text):
@@ -184,9 +238,12 @@ def build(day, moment):
     if not ready:
         head.append("Рутина сводку за %s не собрала: остальные разделы делает навык seb-today." % ddmm(day))
     head.append("Первая строка показа: «%s»." % marker(day))
-    parts = ["\n".join(head), "## Напоминания\n\n" + render_reminders(items)]
+    daily_text = common.read_text(rel) if ready else None
+    groups = reminder_groups(daily_text) if ready else []
+    hidden = hidden_groups() if groups else set()
+    parts = ["\n".join(head), "## Напоминания\n\n" + render_reminders(items, groups, hidden)]
     if ready:
-        parts.append(render_daily(common.read_text(rel)))
+        parts.append(render_daily(daily_text))
     text = "\n\n".join(p for p in parts if p)
     if len(text) > MAX_CONTEXT:
         full = os.path.join(DELIVER_DIR, "summary-%s.md" % day.isoformat())

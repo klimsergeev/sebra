@@ -27,8 +27,9 @@ ZONES_TEXT = {
     "seb-digester": "создаёшь и меняешь data/wiki/, data/tasks/, data/index.md; в записях data/records/ меняешь "
                     "только поля шапки status, error",
     "seb-gardener": "создаёшь страницы в data/wiki/; меняешь data/wiki/, data/tasks/, data/index.md",
-    "seb-reporter": "создаёшь сводки в data/reports/daily/ и data/reports/weekly/ и только дописываешь их",
-    "seb-rules": "меняешь rules.local.md",
+    "seb-reporter": "создаёшь сводки в data/reports/daily/ и data/reports/weekly/; свою ещё не сохранённую правишь как "
+                    "угодно, сохранённую commit.py — только дописываешь",
+    "seb-rules": "меняешь rules.local.md; вид сводки — только python3 engine/scripts/views.py set, reset и rules-moved",
     "seb-challenger": "в базу не пишешь",
     "seb-restorer": "меняешь существующие файлы data/wiki/, data/tasks/, data/index.md — только для удаления "
                     "по просьбе пользователя",
@@ -40,10 +41,11 @@ R_AGENT = ("{who} не пишет в {path}. Твои зоны: {zones}. Нуж�
            "и что не сделано.")
 R_UNKNOWN = "Писать в базу могут только агенты seb-…"
 R_OUTSIDE = "Запись вне базы запрещена: {path}. Рабочие файлы — только в /tmp/sebra/."
-R_PROTECTED = ("{path} напрямую не правится: настройки — python3 engine/scripts/config.py, журнал — python3 "
-               "engine/scripts/journal.py, напоминания — python3 engine/scripts/remind.py, движок — python3 "
-               "engine/scripts/update_engine.py, git — python3 engine/scripts/commit.py.")
-R_APPEND = ("{path} — только дописывание: прежний текст не меняется. Допиши новое после последней строки "
+R_PROTECTED = ("{path} напрямую не правится: настройки — python3 engine/scripts/config.py, вид сводки — python3 "
+               "engine/scripts/views.py, журнал — python3 engine/scripts/journal.py, напоминания — python3 "
+               "engine/scripts/remind.py, движок — python3 engine/scripts/update_engine.py, git — python3 "
+               "engine/scripts/commit.py.")
+R_APPEND = ("{path} уже сохранён — только дописывание: прежний текст не меняется. Допиши новое после последней строки "
             "(Edit: old_string — последняя строка целиком, new_string — она же и новое после неё).")
 R_RECORD_NEW = "{path}: записи создаёт только python3 engine/scripts/record.py new."
 R_RECORD = ("{path}: записи не меняются — тело никогда, в шапке только поля {fields}. Изменено: {what}.")
@@ -57,6 +59,8 @@ B_DELETE = ("{prog}: удалять, переименовывать и пере�
 B_SHELL = "{prog}: вложенный shell и eval не разрешены — запускай простые команды по одной."
 B_PYTHON = "Python — только скрипты движка: python3 engine/scripts/<имя>.py"
 B_CONFIG = "Настройки меняет только основная сессия навыком seb-settings"
+B_VIEWS = "Вид сводки меняет только агент seb-rules (навык seb-view)"
+SAVED_TIMEOUT = 4   # секунд на каждый из двух вызовов git в common.in_head: хук ограничен 10 секундами
 B_GIT = "git {sub}: только через скрипты движка"
 B_GIT_OPTION = "git {opt}: глобальный параметр запрещён — можно только -C, --no-pager, -P, --no-optional-locks"
 B_RESTORE = ("git restore: seb-restorer восстанавливает только файлы data/ вне data/log/, командой "
@@ -87,9 +91,17 @@ def is_data(rel):
 
 
 def protected(rel, engine):
-    """Закрыто всем: файлы движка, .git/, config.yaml, engine.lock, data/log/, data/reminders/."""
-    return (rel in engine or rel in (common.CONFIG, common.ENGINE_LOCK) or under(rel, ".git")
+    """Закрыто всем: файлы движка, .git/, config.yaml, views.yaml, engine.lock, data/log/, data/reminders/."""
+    return (rel in engine or rel in (common.CONFIG, common.VIEWS, common.ENGINE_LOCK) or under(rel, ".git")
             or under(rel, common.LOG) or under(rel, common.REMINDERS))
+
+
+def saved(rel):
+    """Файл есть в HEAD сессии. git не ответил или ошибся — считается сохранённым: остаётся только дописывание."""
+    try:
+        return common.in_head(rel, timeout=SAVED_TIMEOUT)
+    except common.Fail:
+        return True
 
 
 def rights(who, rel):
@@ -199,7 +211,10 @@ def decide_file(tool, ti, who, root):
             return "deny", R_NOT_FOUND.format(path=rel)
         new = old.replace(old_s, new_s) if ti.get("replace_all") else old.replace(old_s, new_s, 1)
     if mode == "append":
-        return None if new.startswith(old) else ("deny", R_APPEND.format(path=rel))
+        # своя ещё не сохранённая сводка — правка в любом месте: снимком дня она станет после commit.py
+        if new.startswith(old) or (who == "seb-reporter" and not saved(rel)):
+            return None
+        return "deny", R_APPEND.format(path=rel)
     if mode == "record":
         allowed = RECORD_FIELDS[who]
         what = record_change(old, new, allowed)
@@ -814,10 +829,12 @@ def check_python(words, args, ctx):
         real = resolve(ctx, args[0])
         script = os.path.join(ctx.root, common.ENGINE_DIR, "scripts", os.path.basename(args[0]))
         if real is not None and real == os.path.realpath(script) and os.path.isfile(script):
-            if os.path.basename(script) == "config.py" and ctx.who:
-                sub = next((a for a in args[1:] if not a.startswith("-")), None)
-                if sub in ("init", "set", "migrate"):
-                    return B_CONFIG
+            name = os.path.basename(script)
+            sub = next((a for a in args[1:] if not a.startswith("-")), None)
+            if name == "config.py" and ctx.who and sub in ("init", "set", "migrate"):
+                return B_CONFIG
+            if name == "views.py" and ctx.who != "seb-rules" and sub in ("set", "reset", "rules-moved"):
+                return B_VIEWS
             return None
     return B_PYTHON
 

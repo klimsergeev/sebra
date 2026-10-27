@@ -1,0 +1,18 @@
+# Вид сводки и списка дел по умолчанию — файл движка. Свой вид пользователя — views.yaml в корне базы; его пишет только python3 engine/scripts/views.py
+
+reminders:
+  groups: []
+
+tasks:
+  each_task: every_group
+  groups:
+    - title: "Просрочено"
+      when: [overdue]
+    - title: "На сегодня"
+      when: [today]
+    - title: "Без движения"
+      stuck: yes
+    - title: "В работе"
+      status: [doing]
+    - title: "Ждёт ответа"
+      status: [waiting]

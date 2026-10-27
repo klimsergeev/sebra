@@ -5,8 +5,9 @@ python3 engine/scripts/collect.py history
 python3 engine/scripts/collect.py slug "<название>" [--json]
 python3 engine/scripts/collect.py daily      (всегда JSON)
 python3 engine/scripts/collect.py weekly     (всегда JSON)
+python3 engine/scripts/collect.py tasks      (всегда JSON: date, view, active, errors — для списка дел)
 
-Поля daily: date, boundary, reminders, tasks, gardener, documents, closed, deleted, errors.
+Поля daily: date, boundary, reminders, tasks, view, active, gardener, documents, closed, deleted, errors.
 weekly — те же с границей «начало дня week_from», плюс week_from, week_to, records, new_pages, facts_added,
 new_tasks, corrections, engine. Сбой поля — null и запись {"field", "message"} в errors, выход 0.
 """
@@ -21,6 +22,7 @@ import sys
 import unicodedata
 
 import common
+import views
 from common import Fail
 
 # ICAO Doc 9303, часть 3, раздел 6, таблица B
@@ -37,6 +39,7 @@ GARDENER_ACTIONS = ("слито", "исправлено", "пересобран�
                     "привязано")
 DIGESTER_DONE = ("разобрано", "не читается")
 FACT_PAGES = ("data/wiki/topics", "data/wiki/people", "data/wiki/projects")
+TASK_STATUSES = ("open", "doing", "waiting", "done", "dropped")
 
 
 # ---------------------------------------------------------------- now, slug, history
@@ -212,26 +215,36 @@ def field_reminders(today, errors):
     return data["reminders"]
 
 
+def open_task(p):
+    """Шапка открытой задачи; закрытая — None; шапка не по формату — ValueError с путём задачи."""
+    try:
+        h = read_header(p)
+        status = h.get("status")
+        if status not in TASK_STATUSES:
+            raise ValueError("status: %r" % status)
+        if status not in views.OPEN:
+            return None
+        if h.get("due") != "none":
+            parse_date(h.get("due"), "due")
+        parse_date(h.get("updated"), "updated")
+        if not isinstance(h.get("title"), str):
+            raise ValueError("title: не строка")
+    except (ValueError, OSError, UnicodeDecodeError) as e:
+        raise ValueError("%s: %s" % (rel(p), e)) from None
+    return h
+
+
 def field_tasks(today, cfg):
     groups = {"overdue": [], "today": [], "stuck": [], "doing": [], "waiting": []}
     stuck_days = cfg["tasks.stuck_after_days"]
     for p in md_files(common.TASKS):
-        try:
-            h = read_header(p)
-            status = h.get("status")
-            if status not in ("open", "doing", "waiting", "done", "dropped"):
-                raise ValueError("status: %r" % status)
-            if status not in ("open", "doing", "waiting"):
-                continue
-            due = h.get("due")
-            due_date = None if due == "none" else parse_date(due, "due")
-            updated = parse_date(h.get("updated"), "updated")
-            title = h.get("title")
-            if not isinstance(title, str):
-                raise ValueError("title: не строка")
-        except (ValueError, OSError, UnicodeDecodeError) as e:
-            raise ValueError("%s: %s" % (rel(p), e)) from None
-        item = {"path": rel(p), "title": title, "due": due, "status": status, "updated": h.get("updated")}
+        h = open_task(p)
+        if h is None:
+            continue
+        status, due = h["status"], h["due"]
+        due_date = None if due == "none" else parse_date(due, "due")
+        updated = parse_date(h["updated"], "updated")
+        item = {"path": rel(p), "title": h["title"], "due": due, "status": status, "updated": h["updated"]}
         if due_date is not None and due_date < today:
             groups["overdue"].append(item)
         elif due_date is not None and due_date == today:
@@ -243,6 +256,38 @@ def field_tasks(today, cfg):
         if status == "waiting":
             groups["waiting"].append(item)
     return groups
+
+
+def field_view(errors):
+    """Вид сводки: {"source", "reminders", "tasks"}; свой вид не прочитался — вид по умолчанию и запись view в errors."""
+    view, source, problems = views.load()
+    if problems:
+        errors.append({"field": "view", "message": "; ".join(problems)})
+    out = {"source": source}
+    out.update(view)
+    return out
+
+
+def text_field(header, name):
+    value = header.get(name)
+    return value if isinstance(value, str) else ""
+
+
+def field_active(today, cfg, view):
+    """Открытые задачи по сроку (без срока — последними, при равном — по пути) с группами вида."""
+    stuck_days = cfg["tasks.stuck_after_days"]
+    out = []
+    for p in md_files(common.TASKS):
+        h = open_task(p)
+        if h is None:
+            continue
+        state = views.task_state(h, today, stuck_days)
+        out.append({"path": rel(p), "title": h["title"], "due": h["due"], "status": h["status"],
+                    "updated": h["updated"], "area": text_field(h, "area"), "project": text_field(h, "project"),
+                    "stuck": state["stuck"],
+                    "groups": views.task_groups(view["tasks"], h, today, stuck_days) if view else []})
+    out.sort(key=lambda t: (t["due"] == "none", t["due"], t["path"]))
+    return out
 
 
 def field_gardener(boundary, today):
@@ -409,9 +454,8 @@ def field_engine():
 # ---------------------------------------------------------------- сборка
 
 
-def collect(weekly):
-    common.ensure_repo()
-    errors = []
+def settings(errors):
+    """Настройки; сломанный config.yaml — умолчания, пояс по умолчанию и запись config в errors."""
     try:
         cfg = common.config()
         common.timezone()
@@ -422,17 +466,40 @@ def collect(weekly):
         errors.append({"field": "config", "message": e.message})
         cfg = common.defaults()
         common.use_timezone(common.timezone(cfg["owner.timezone"]))
+    return cfg
+
+
+def guarded(errors, name, fn, *args):
+    """Значение поля; сбой — None и запись {"field", "message"} в errors."""
+    try:
+        return fn(*args)
+    except (ValueError, OSError, UnicodeDecodeError, Fail, KeyError, TypeError) as e:
+        errors.append({"field": name, "message": getattr(e, "message", None) or str(e)})
+        return None
+
+
+def cmd_tasks():
+    """Открытые задачи и вид — для списка дел вне сводки; без истории, напоминаний и журнала."""
+    errors = []
+    cfg = settings(errors)
+    today = common.now().date()
+    view = guarded(errors, "view", field_view, errors)
+    active = guarded(errors, "active", field_active, today, cfg, view)
+    print(json.dumps({"date": today.isoformat(), "view": view, "active": active, "errors": errors},
+                     ensure_ascii=False, indent=1))
+    return 0
+
+
+def collect(weekly):
+    common.ensure_repo()
+    errors = []
+    cfg = settings(errors)
     moment = common.now()
     today = moment.date()
     result = {"date": today.isoformat()}
 
     def field(name, fn, *args):
-        try:
-            value = fn(*args)
-        except (ValueError, OSError, UnicodeDecodeError, Fail, KeyError, TypeError) as e:
-            errors.append({"field": name, "message": getattr(e, "message", None) or str(e)})
-            value = None
-        return value
+        return guarded(errors, name, fn, *args)
 
     # неглубокая копия: --diff-filter=A считает добавленными все файлы граничного коммита
     try:
@@ -454,6 +521,8 @@ def collect(weekly):
     result["boundary"] = boundary.moment.isoformat() if boundary else None
     result["reminders"] = field("reminders", field_reminders, today, errors)
     result["tasks"] = field("tasks", field_tasks, today, cfg)
+    result["view"] = field("view", field_view, errors)
+    result["active"] = field("active", field_active, today, cfg, result["view"])
     result["gardener"] = field("gardener", field_gardener, boundary, today)
     result["documents"] = field("documents", field_documents, boundary, today)
     result["closed"] = field("closed", field_closed, boundary)
@@ -477,7 +546,7 @@ def main():
     json_mode = "--json" in args
     args = [a for a in args if a != "--json"]
     if not args:
-        raise Fail(2, "команда: now, history, slug, daily или weekly")
+        raise Fail(2, "команда: now, history, slug, daily, weekly или tasks")
     cmd, rest = args[0], args[1:]
     if cmd == "now" and not rest:
         return cmd_now(json_mode)
@@ -487,8 +556,10 @@ def main():
         return cmd_slug(rest[0], json_mode)
     if cmd in ("daily", "weekly") and not rest:
         return collect(cmd == "weekly")
+    if cmd == "tasks" and not rest:
+        return cmd_tasks()
     raise Fail(2, "ошибка вызова: collect.py %s" % " ".join(sys.argv[1:]))
 
 
 if __name__ == "__main__":
-    common.run_main(main, common.has_json_flag(sys.argv) or sys.argv[1:2] in (["daily"], ["weekly"]))
+    common.run_main(main, common.has_json_flag(sys.argv) or sys.argv[1:2] in (["daily"], ["weekly"], ["tasks"]))
