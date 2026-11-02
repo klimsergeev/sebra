@@ -3,6 +3,9 @@
 python3 engine/scripts/commit.py --who <исполнитель> --message "<что>" [--json] [<пути…>]
 
 Никогда не отправляет с --force и никогда не отправляет ветку сессии: только `git push origin HEAD:main`.
+
+Every save except --who engine first carries the detailed trace from /tmp/sebra/trace/ into data/log/trace/
+(trace_log.carry); the trace files leave in the same commit as the journal lines.
 """
 
 import argparse
@@ -18,6 +21,7 @@ import tempfile
 import time
 
 import common
+import trace_log
 from common import Fail
 
 LOCK_WAIT = 60
@@ -344,6 +348,17 @@ def check_rights(who, paths, entries):
                       "(и seb-intake — напоминания): %s" % p)
 
 
+def carry_trace():
+    """Detailed trace: work files of /tmp/sebra/trace/ go to data/log/trace/ and leave with this save's journal paths;
+    day files older than 30 days are removed in the same commit (formats.md, «Подробный лог»). A failure here does not
+    stop the save: the lines stay in the work files and go with the next save."""
+    try:
+        trace_log.carry(common.ROOT, common.now().date())
+    except Exception as e:  # noqa: BLE001
+        print("commit.py: подробный лог не перенесён (%s)" % (e.message if isinstance(e, Fail) else e),
+              file=sys.stderr)
+
+
 def run(args, res):
     common.ensure_repo()
     common.check_who(args.who)
@@ -358,6 +373,9 @@ def run(args, res):
             raise Fail(2, "нет такого пути ни на диске, ни в HEAD: %s" % p)
     entries = porcelain(*paths, codes=True) if paths else []
     check_rights(args.who, paths, entries)
+    if args.who != "engine":
+        # the engine update saves and rolls back only its own paths
+        carry_trace()
     logs = porcelain(common.LOG + "/")
     for p in logs:
         if p not in paths:
@@ -427,6 +445,20 @@ def run(args, res):
 
 
 def main():
+    """Trace event `script` with the exit code at the end; its duration includes carrying the trace."""
+    start = time.time()
+    code = 1
+    try:
+        code = _main()
+        return code
+    except SystemExit as e:
+        code = common.exit_code(e.code)
+        raise
+    finally:
+        common.trace_mark("script", "commit.py", start, {"code": code})
+
+
+def _main():
     p = Parser(prog="commit.py")
     p.add_argument("--who", required=True)
     p.add_argument("--message", required=True)

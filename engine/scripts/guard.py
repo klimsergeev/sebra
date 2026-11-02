@@ -12,6 +12,7 @@ import os
 import re
 import shlex
 import sys
+import time
 
 import common
 
@@ -914,18 +915,28 @@ def decide(inp):
     return decide_file(tool, ti, inp.get("agent_type"), root)
 
 
+def mark(start, inp, deny):
+    """Trace event `hook` after the decision (formats.md, «Подробный лог»): x.deny — only when denied."""
+    sid, pid = common.hook_ids(inp)
+    common.trace_mark("hook", "guard.py", start, {"deny": True} if deny else None, sid=sid, pid=pid)
+
+
 def main():
+    start = time.time()
+    inp = None
     try:
         inp = json.loads(sys.stdin.read())
         decision = decide(inp)
     except Exception as e:  # noqa: BLE001 — любая ошибка хука — запрет
         message = getattr(e, "message", None) or str(e) or type(e).__name__
         print("guard.py: внутренняя ошибка: %s" % message, file=sys.stderr)
+        mark(start, inp, True)
         sys.exit(2)
     if decision:
         kind, reason = decision
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": kind,
                                                  "permissionDecisionReason": reason}}, ensure_ascii=False))
+    mark(start, inp, bool(decision) and decision[0] == "deny")
     sys.exit(0)
 
 

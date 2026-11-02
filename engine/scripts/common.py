@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 # PyYAML лежит в движке: в облаке его нет, а установка в сессии её не переживает.
@@ -62,17 +63,35 @@ class Fail(Exception):
         self.message = message
 
 
+def exit_code(value):
+    """Exit code of sys.exit(value): None — 0, a number — itself, anything else — 1."""
+    if value is None:
+        return 0
+    return value if isinstance(value, int) else 1
+
+
 def run_main(main, json_mode=False):
-    """Запускает main(); Fail превращает в текст (или {"error"} при --json) и код выхода."""
+    """Запускает main(); Fail превращает в текст (или {"error"} при --json) и код выхода.
+
+    In the end — the `script` trace event with the exit code (formats.md, «Подробный лог»), also on Fail and sys.exit.
+    """
+    start = time.time()
+    code = 1  # an unexpected exception ends with a traceback and code 1
     try:
-        code = main()
-    except Fail as e:
-        if json_mode:
-            print(json.dumps({"error": e.message}, ensure_ascii=False))
-        else:
-            print(e.message, file=sys.stderr)
-        sys.exit(e.code)
-    sys.exit(code or 0)
+        try:
+            code = main() or 0
+        except Fail as e:
+            if json_mode:
+                print(json.dumps({"error": e.message}, ensure_ascii=False))
+            else:
+                print(e.message, file=sys.stderr)
+            code = e.code
+        except SystemExit as e:
+            code = exit_code(e.code)
+            raise
+    finally:
+        trace_mark("script", None, start, {"code": code})
+    sys.exit(code)
 
 
 def path(*parts):
@@ -710,6 +729,90 @@ def save_session(sid, data):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
     os.replace(tmp, p)
+
+
+# ---------------------------------------------------------------- подробный лог
+# Events go to /tmp/sebra/trace/<session_id>.jsonl through trace_log.append; commit.py carries them into
+# data/log/trace/ (formats.md, «Подробный лог»). trace_log is imported only after the flag check.
+
+TRACE_DIR_DEFAULT = "/tmp/sebra/trace"
+
+
+def trace_dir():
+    """Folder of the trace flag and work files: SEBRA_TRACE_DIR for tests, otherwise /tmp/sebra/trace."""
+    return os.environ.get("SEBRA_TRACE_DIR") or TRACE_DIR_DEFAULT
+
+
+def trace_on():
+    return os.path.exists(os.path.join(trace_dir(), "on"))
+
+
+def set_trace_flag(enabled):
+    """Put or remove the flag `on` that trace hooks check before starting Python; errors are ignored."""
+    try:
+        flag = os.path.join(trace_dir(), "on")
+        if enabled:
+            os.makedirs(trace_dir(), exist_ok=True)
+            with open(flag, "a", encoding="utf-8"):
+                pass
+        elif os.path.lexists(flag):
+            os.remove(flag)
+    except Exception:  # noqa: BLE001 — the trace never fails a script
+        pass
+
+
+def trace_event(kind, sid=None, pid=None, what=None, ms=None, extra=None, t=None):
+    """One trace event in the session work file, only when the flag is set; never raises.
+
+    sid — session_id of a hook input, otherwise CLAUDE_CODE_SESSION_ID, otherwise «nosession».
+    """
+    try:
+        if not trace_on():
+            return
+        import trace_log
+
+        if not isinstance(sid, str) or not sid:
+            sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+        sid = trace_log.clean_sid(sid)
+        event = {"t": round(time.time() if t is None else t, 3), "ev": kind, "sid": sid}
+        if isinstance(pid, str) and pid:
+            event["pid"] = pid
+        if what is not None:
+            event["what"] = what
+        if ms is not None:
+            event["ms"] = ms
+        if extra:
+            event["x"] = extra
+        trace_log.append(sid, event)
+    except Exception:  # noqa: BLE001 — the trace never fails a script or a hook
+        pass
+
+
+def trace_mark(kind, what, start, extra=None, sid=None, pid=None):
+    """Event `script` or `hook`: t — now (the end of the work), ms — since start (time.time()).
+
+    what=None — the script label trace_log.script_label(sys.argv). No flag — nothing; never raises.
+    """
+    try:
+        if not trace_on():
+            return
+        end = time.time()
+        if what is None:
+            import trace_log
+
+            what = trace_log.script_label(sys.argv)
+        trace_event(kind, sid=sid, pid=pid, what=what, ms=max(0, int(round((end - start) * 1000))), extra=extra,
+                    t=end)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def hook_ids(inp):
+    """(session_id, prompt_id) of a hook input; missing or not strings — None."""
+    if not isinstance(inp, dict):
+        return None, None
+    sid, pid = inp.get("session_id"), inp.get("prompt_id")
+    return (sid if isinstance(sid, str) and sid else None), (pid if isinstance(pid, str) and pid else None)
 
 
 def version_tuple(v):

@@ -47,3 +47,6 @@ agents:
   rules: "opus"                # модель правил из поправок
   challenger: "fable"          # модель спорщика
   restorer: "sonnet"           # модель отката и удаления
+
+trace:
+  enabled: yes                 # подробный лог шагов для разработчика: yes — писать, no — не писать

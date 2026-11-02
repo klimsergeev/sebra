@@ -20,6 +20,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 
 import common
 import remind
@@ -571,20 +572,35 @@ def cmd_status(args):
 # ---------------------------------------------------------------- вход
 
 
-def run_hook(fn):
+HOOKS = {"hook-prompt": hook_prompt, "hook-stop": hook_stop}
+
+
+def run_hook(name):
+    """Hook hook-prompt or hook-stop; exactly one trace event `hook` in the end and exit code 0.
+
+    Hooks bypass common.run_main (it would add a `script` event): __main__ dispatches them before it.
+    """
+    start = time.time()
+    inp = {}
     try:
-        inp = json.loads(sys.stdin.read() or "{}")
-        out = fn(inp if isinstance(inp, dict) else {})
-        if out:
-            print(json.dumps(out, ensure_ascii=False))
-    except Exception as e:  # noqa: BLE001 — хук не падает и не мешает ходу
-        print("deliver.py: %s" % (e.message if isinstance(e, Fail) else e), file=sys.stderr)
+        try:
+            inp = json.loads(sys.stdin.read() or "{}")
+            out = HOOKS[name](inp if isinstance(inp, dict) else {})
+            if out:
+                print(json.dumps(out, ensure_ascii=False))
+        except Exception as e:  # noqa: BLE001 — хук не падает и не мешает ходу
+            print("deliver.py: %s" % (e.message if isinstance(e, Fail) else e), file=sys.stderr)
+    finally:
+        sid, pid = common.hook_ids(inp)
+        common.trace_mark("hook", "deliver.py " + name, start, sid=sid, pid=pid)
     sys.exit(0)
 
 
 def main():
     p = Parser(prog="deliver.py")
     sub = p.add_subparsers(dest="cmd")
+    # hook-prompt and hook-stop without extra arguments never get here (see __main__); with extra arguments the
+    # parser refuses with code 2, as before
     sub.add_parser("hook-prompt")
     sub.add_parser("hook-stop")
     s = sub.add_parser("shown")
@@ -595,10 +611,6 @@ def main():
     for sp in sub.choices.values():
         sp.error = p.error
     args = p.parse_args()
-    if args.cmd == "hook-prompt":
-        run_hook(hook_prompt)
-    if args.cmd == "hook-stop":
-        run_hook(hook_stop)
     handlers = {"shown": cmd_shown, "send": cmd_send, "status": cmd_status}
     if args.cmd not in handlers:
         raise Fail(2, "команда: hook-prompt, hook-stop, shown, send или status")
@@ -611,4 +623,6 @@ def main():
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 2 and sys.argv[1] in HOOKS:
+        run_hook(sys.argv[1])
     common.run_main(main, common.has_json_flag(sys.argv))

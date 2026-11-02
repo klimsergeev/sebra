@@ -17,6 +17,8 @@ from common import Fail
 
 import yaml
 
+TRACE_KEY = "trace.enabled"  # flag /tmp/sebra/trace/on for the trace hooks (formats.md, «Подробный лог»)
+
 
 class Parser(argparse.ArgumentParser):
     def error(self, message):
@@ -113,6 +115,9 @@ def cmd_set(args):
     if text != old:
         common.write_atomic(common.CONFIG, text)  # последним — config.yaml
         files.append(common.CONFIG)
+    if any(key == TRACE_KEY for key, _ in pairs):
+        # the trace flag follows the setting at once, even if the value was already the same
+        common.set_trace_flag(values[TRACE_KEY] is True)
     if args.json:
         print(json.dumps({"changed": changed, "files": sorted(files)}, ensure_ascii=False))
     else:

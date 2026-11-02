@@ -33,6 +33,7 @@ KIND_BY_DIR = {
     common.REMINDERS: "reminder", common.REPORTS_DAILY: "daily", common.REPORTS_WEEKLY: "weekly",
     common.LOG: "log",
 }
+TRACE = common.LOG + "/trace"   # detailed trace log: names only, lines are never read (formats.md)
 PAGE_KINDS = ("topic", "person", "project")
 WIKI_KINDS = PAGE_KINDS + ("source",)
 WITH_HEADER = ("record",) + WIKI_KINDS + ("task", "daily", "weekly")
@@ -47,6 +48,7 @@ NAMES = {
     "topic": _PLAIN, "person": _PLAIN, "project": _PLAIN,
     "source": _DATED, "task": _DATED,
     "reminder": _DAY, "daily": _DAY, "weekly": _DAY, "log": _DAY,
+    "trace": re.compile(r"(?P<d>%s)-[A-Za-z0-9_-]{1,128}\.jsonl" % DATE),
 }
 
 # ---------------------------------------------------------------- разделы
@@ -394,6 +396,8 @@ class Lint:
         if rel == common.ENGINE_LOCK:
             return "engine"
         folder, name = os.path.split(rel)
+        if folder == TRACE and name.endswith(".jsonl") and not name.startswith("."):
+            return "trace"
         if name.startswith(".") or not name.endswith(".md"):
             return None
         return KIND_BY_DIR.get(folder)
@@ -501,6 +505,9 @@ class Lint:
             once("data/%s/" % parts[1], "layout", "в data/ только index.md и папки %s"
                  % ", ".join(d + "/" for d in DATA_SUBDIRS))
             return
+        if parts[1] == "log" and len(parts) > 3:
+            self.check_trace_layout(rel, parts, once)
+            return
         depth = 3
         if parts[1] in NESTED:
             allowed = NESTED[parts[1]]
@@ -521,6 +528,17 @@ class Lint:
         elif not parts[-1].endswith(".md"):
             self.add(rel, "layout", "в папке данных только файлы .md")
 
+    def check_trace_layout(self, rel, parts, once):
+        """Inside data/log/ only journal files and the trace/ folder; trace/ holds only .jsonl files, no subfolders."""
+        if parts[2] != "trace":
+            once("data/log/%s/" % parts[2], "layout", "в data/log/ только файлы .md и папка trace/")
+        elif len(parts) > 4:
+            once("data/log/trace/%s/" % parts[3], "layout", "вложенная папка: в data/log/trace/ только файлы .jsonl")
+        elif parts[3].startswith("."):
+            self.add(rel, "layout", "скрытый файл в папке данных")
+        elif not parts[3].endswith(".jsonl"):
+            self.add(rel, "layout", "в data/log/trace/ только файлы .jsonl")
+
     # ---------------------------------------------------------- один файл
 
     def check_file(self, rel):
@@ -528,6 +546,8 @@ class Lint:
         if kind is None:
             return
         name_match = self.check_name(rel, kind) if kind in NAMES else None
+        if kind == "trace":
+            return  # trace log: file name only, content is not read (formats.md, «Подробный лог»)
         if not self.check_encoding(rel):
             return
         text = self.text_of(rel)

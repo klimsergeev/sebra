@@ -7,11 +7,16 @@ python3 "$CLAUDE_PROJECT_DIR/engine/scripts/session_start.py" (вход — JSON
 и после сжатия контекста); хук на сообщение сравнивает её с engine.lock.
 
 Код выхода всегда 0: от хука ничего не зависит, сбой пункта — строка «<пункт>: не удалось (<причина>)».
+
+Detailed trace: the hook puts or removes the flag /tmp/sebra/trace/on by trace.enabled on every run and writes the
+events `session` and `hook` (formats.md, «Подробный лог»); nothing about it goes to stdout.
 """
 
 import json
 import os
+import re
 import sys
+import time
 
 import common
 import deliver
@@ -89,9 +94,33 @@ def rules_line():
     return None
 
 
-def main():
-    inp = read_input()
+SOURCES = ("startup", "resume", "clear", "compact")
+
+
+def trace_start(inp):
+    """Trace flag by trace.enabled and the `session` event (formats.md, «Подробный лог»). Settings unreadable — the
+    flag stays as it was. Prints nothing: stdout goes into the session context."""
+    try:
+        enabled = common.config().get("trace.enabled", True)
+    except Exception:  # noqa: BLE001 — the hook does not fail
+        return
+    common.set_trace_flag(enabled is True)
+    try:
+        version = common.lock_version() or common.read_text(common.ENGINE_DIR + "/VERSION").strip()
+    except Exception:  # noqa: BLE001
+        version = ""
+    source = inp.get("source")
+    sid, pid = common.hook_ids(inp)
+    common.trace_event("session", sid=sid, pid=pid, extra={
+        "source": source if source in SOURCES else "?",
+        "version": version if re.fullmatch(r"\d+\.\d+\.\d+", version) else "?",
+        "remote": os.environ.get("CLAUDE_CODE_REMOTE") == "true",
+    })
+
+
+def main(inp):
     source = inp.get("source", "")
+    trace_start(inp)
     remember_version(inp.get("session_id"))
     last = None
     if source in ("startup", "resume"):
@@ -111,8 +140,13 @@ def main():
 
 
 if __name__ == "__main__":
+    started = time.time()
+    hook_input = {}
     try:
-        main()
+        hook_input = read_input()
+        main(hook_input)
     except Exception as e:  # noqa: BLE001
         print("Sebra: хук начала сессии не удался (%s)" % e)
+    session_id, prompt_id = common.hook_ids(hook_input)
+    common.trace_mark("hook", "session_start.py", started, sid=session_id, pid=prompt_id)
     sys.exit(0)

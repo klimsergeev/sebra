@@ -25,8 +25,24 @@
   },
   "hooks": {
     "SessionStart": [{ "hooks": [{ "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/engine/scripts/session_start.py\"", "timeout": 30 }] }],
-    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/engine/scripts/deliver.py\" hook-prompt", "timeout": 25 }] }],
-    "PreToolUse": [{ "matcher": "Write|Edit|Bash", "hooks": [{ "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/engine/scripts/guard.py\"", "timeout": 10 }] }],
-    "Stop": [{ "hooks": [{ "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/engine/scripts/deliver.py\" hook-stop", "timeout": 30 }] }]
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/engine/scripts/deliver.py\" hook-prompt", "timeout": 25 }] },
+      { "hooks": [{ "type": "command", "command": "[ -e /tmp/sebra/trace/on ] && python3 \"$CLAUDE_PROJECT_DIR/engine/scripts/trace_log.py\" hook; exit 0", "async": true }] }
+    ],
+    "PreToolUse": [
+      { "matcher": "Write|Edit|Bash", "hooks": [{ "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/engine/scripts/guard.py\"", "timeout": 10 }] },
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "[ -e /tmp/sebra/trace/on ] && python3 \"$CLAUDE_PROJECT_DIR/engine/scripts/trace_log.py\" hook; exit 0", "async": true }] }
+    ],
+    "PostToolUse": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "[ -e /tmp/sebra/trace/on ] && python3 \"$CLAUDE_PROJECT_DIR/engine/scripts/trace_log.py\" hook; exit 0", "async": true }] }],
+    "PostToolUseFailure": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "[ -e /tmp/sebra/trace/on ] && python3 \"$CLAUDE_PROJECT_DIR/engine/scripts/trace_log.py\" hook; exit 0", "async": true }] }],
+    "SubagentStart": [{ "hooks": [{ "type": "command", "command": "[ -e /tmp/sebra/trace/on ] && python3 \"$CLAUDE_PROJECT_DIR/engine/scripts/trace_log.py\" hook; exit 0", "async": true }] }],
+    "SubagentStop": [{ "hooks": [{ "type": "command", "command": "[ -e /tmp/sebra/trace/on ] && python3 \"$CLAUDE_PROJECT_DIR/engine/scripts/trace_log.py\" hook; exit 0", "async": true }] }],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/engine/scripts/deliver.py\" hook-stop", "timeout": 30 }] },
+      { "hooks": [{ "type": "command", "command": "[ -e /tmp/sebra/trace/on ] && python3 \"$CLAUDE_PROJECT_DIR/engine/scripts/trace_log.py\" hook; exit 0", "async": true }] }
+    ],
+    "StopFailure": [{ "hooks": [{ "type": "command", "command": "[ -e /tmp/sebra/trace/on ] && python3 \"$CLAUDE_PROJECT_DIR/engine/scripts/trace_log.py\" hook; exit 0", "async": true }] }],
+    "PreCompact": [{ "hooks": [{ "type": "command", "command": "[ -e /tmp/sebra/trace/on ] && python3 \"$CLAUDE_PROJECT_DIR/engine/scripts/trace_log.py\" hook; exit 0", "async": true }] }],
+    "PostCompact": [{ "hooks": [{ "type": "command", "command": "[ -e /tmp/sebra/trace/on ] && python3 \"$CLAUDE_PROJECT_DIR/engine/scripts/trace_log.py\" hook; exit 0", "async": true }] }]
   }
 }
