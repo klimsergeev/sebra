@@ -3,7 +3,7 @@
 python3 engine/scripts/lint.py [--json] [пути…]
 
 Без путей проверяет всю базу; с путями — только эти файлы (все правила, кроме root, layout и engine).
-Форматы — engine/docs/formats.md.
+Форматы — engine/docs/formats.md; настроек, engine.lock и подробного лога — engine/docs/script-formats.md.
 Коды: 0 — нарушений нет; 1 — есть нарушения; 2 — ошибка вызова; 3 — окружение.
 """
 
@@ -33,7 +33,7 @@ KIND_BY_DIR = {
     common.REMINDERS: "reminder", common.REPORTS_DAILY: "daily", common.REPORTS_WEEKLY: "weekly",
     common.LOG: "log",
 }
-TRACE = common.LOG + "/trace"   # detailed trace log: names only, lines are never read (formats.md)
+TRACE = common.LOG + "/trace"   # detailed trace log: names only, lines are never read (script-formats.md)
 PAGE_KINDS = ("topic", "person", "project")
 WIKI_KINDS = PAGE_KINDS + ("source",)
 WITH_HEADER = ("record",) + WIKI_KINDS + ("task", "daily", "weekly")
@@ -70,7 +70,7 @@ HEADING = re.compile(r"^(?P<marks>#{3,}) (?P<title>.*)$")
 # Строка пустого раздела и группы: «Нет» — нынешняя, «нет» — сводок до 0.2.2; обе верны у любой сводки.
 NONE_LINES = ("Нет", "нет")
 UPDATE = re.compile(r"^Обновление ((?:[01]\d|2[0-3]):[0-5]\d)$")
-# Строка пустого дня: нынешняя (formats.md, «Ежедневная сводка») и сводок до 0.2.2; неразрывный пробел равен обычному.
+# Строка пустого дня: нынешняя (formats.md) и сводок до 0.2.2; неразрывный пробел равен обычному.
 EMPTY_DAYS = ("Сегодня пусто: ни дел, ни напоминаний. Садовник ничего не менял",
               "Дел нет, ничего не менялось, зависших задач нет")
 REPORT_KINDS = ("daily", "weekly")
@@ -306,7 +306,7 @@ ATTACHMENT = re.compile(r"^вложение от (?P<d>%s): (?P<name>\S.*)$" % D
 
 
 def pointer_problem(type_, pointer):
-    """pointer по type записи (формат «Запись»): текст ошибки или None."""
+    """pointer по type записи (formats.md): текст ошибки или None."""
     if type_ == "text":
         return None if pointer == "" else "у type text — \"\""
     if type_ == "link":
@@ -547,7 +547,7 @@ class Lint:
             return
         name_match = self.check_name(rel, kind) if kind in NAMES else None
         if kind == "trace":
-            return  # trace log: file name only, content is not read (formats.md, «Подробный лог»)
+            return  # trace log: file name only, content is not read (script-formats.md)
         if not self.check_encoding(rel):
             return
         text = self.text_of(rel)
@@ -887,8 +887,8 @@ class Lint:
         return loose, groups, odd
 
     def check_daily_block(self, rel, n, title, lines):
-        """Форма «Напоминаний» и «Дел на день» любой сводки (formats.md, «Ежедневная сводка»): группы «### », в «Делах
-        на день» — категории «#### » внутри групп; названия непустые, без повторов; пустое — строка «Нет» или «нет»."""
+        """Форма «Напоминаний» и «Дел на день» любой сводки (formats.md): группы «### », в «Делах на день» —
+        категории «#### » внутри групп; названия непустые, без повторов; пустое — строка «Нет» или «нет»."""
         def bad(m, message):
             self.add(rel, "sections", "строка %d: %s" % (m, message))
 
@@ -993,7 +993,7 @@ class Lint:
         return {"tasks": tasks, "reminders": reminders, "stuck": cfg["tasks.stuck_after_days"]}
 
     def check_daily_view(self, rel, body, offset, date):
-        """Новая, ещё не сохранённая сводка — ещё и по виду на день своей шапки (formats.md, «Ежедневная сводка»).
+        """Новая, ещё не сохранённая сводка — ещё и по виду на день своей шапки (formats.md).
 
         Сходится со своим видом пользователя или с видом по умолчанию (запасной ход seb-reporter) — нарушений нет;
         ни с каким — нарушения view по своему виду. Сохранённую — только по форме: вид мог смениться после неё.
@@ -1617,7 +1617,7 @@ class Lint:
         self.check_agent_models(values)
 
     def check_views(self, text):
-        """views.yaml: формат — таблица formats.md, раздел «Вид сводки и списка дел»; текст — тот, что пишет views.py."""
+        """views.yaml: формат — таблица вида formats.md; текст — тот, что пишет views.py."""
         rel = common.VIEWS
         data, errors = views.parse(text, rel)
         if not errors:
@@ -1640,7 +1640,7 @@ class Lint:
         slot = next((k for i, k, _, _ in common.template()[1] if i == n), None)
         if not slot or not isinstance(defaults.get(slot), bool) or not isinstance(values.get(slot), bool):
             return None
-        m = re.match(r"\s+%s:\s*(.*)$" % re.escape(slot.split(".", 1)[1]), line)
+        m = re.match(r"\s*%s:\s*(.*)$" % re.escape(slot.rsplit(".", 1)[-1]), line)
         if not m:
             return None
         try:
@@ -1650,25 +1650,27 @@ class Lint:
         return slot if word != common.format_value(values[slot]) else None
 
     def check_agent_models(self, values):
+        """Строки шапки файлов агентов против настроек: model: — agents.<имя>, effort: — <имя>-effort."""
         rel = common.CONFIG
-        keys = {k[len("agents."):]: v for k, v in values.items() if k.startswith("agents.")}
-        for name, value in sorted(keys.items()):
-            agent = "%s/seb-%s.md" % (common.AGENTS_DIR, name)
-            try:
-                with open(self.abs(agent), "rb") as f:
-                    data = f.read()
-            except OSError:
-                self.add(rel, "config", "agents.%s: нет файла агента %s" % (name, agent))
-                continue
-            model = common.agent_model(data)
-            if model is None:
-                self.add(rel, "config", "agents.%s: в шапке %s не ровно одна строка model:" % (name, agent))
-            elif value in common.AGENT_MODELS and model != value:
-                self.add(rel, "config", "agents.%s: «%s», а в строке model: %s — «%s»" % (name, value, agent, model))
-        for f in sorted(self.engine):
-            m = AGENT_FILE.fullmatch(f)
-            if m and m.group("name") not in keys:
-                self.add(rel, "config", "файл агента %s есть, а ключа agents.%s нет" % (f, m.group("name")))
+        for field, pattern, allowed in common.AGENT_FIELDS:
+            keys = common.agent_keys(values, pattern)
+            for name, value in sorted(keys.items()):
+                key, agent = pattern % name, "%s/seb-%s.md" % (common.AGENTS_DIR, name)
+                try:
+                    with open(self.abs(agent), "rb") as f:
+                        data = f.read()
+                except OSError:
+                    self.add(rel, "config", "%s: нет файла агента %s" % (key, agent))
+                    continue
+                got = common.agent_field(data, field)
+                if got is None:
+                    self.add(rel, "config", "%s: в шапке %s не ровно одна строка %s:" % (key, agent, field))
+                elif value in allowed and got != value:
+                    self.add(rel, "config", "%s: «%s», а в строке %s: %s — «%s»" % (key, value, field, agent, got))
+            for f in sorted(self.engine):
+                m = AGENT_FILE.fullmatch(f)
+                if m and m.group("name") not in keys:
+                    self.add(rel, "config", "файл агента %s есть, а ключа %s нет" % (f, pattern % m.group("name")))
 
     # ---------------------------------------------------------- запуск
 

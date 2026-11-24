@@ -6,9 +6,9 @@ python3 engine/scripts/views.py reset [--section reminders|tasks] [--json]
 python3 engine/scripts/views.py rules-moved [--json]
 
 Вид по умолчанию — engine/views.default.yaml (файл движка), свой вид пользователя — views.yaml в корне базы: раздел
-reminders или tasks из него заменяет такой же раздел вида по умолчанию целиком. Формат — engine/docs/formats.md, раздел
-«Вид сводки и списка дел». views.yaml пишет только этот скрипт: файл для set — весь будущий свой вид, раздел, которого
-в нём нет, — по умолчанию. Строки журнала о виде пишет агент seb-rules; сам скрипт пишет только отметку rules-moved.
+reminders или tasks из него заменяет такой же раздел вида по умолчанию целиком. Формат — engine/docs/formats.md.
+views.yaml пишет только этот скрипт: файл для set — весь будущий свой вид, раздел, которого в нём нет, — по умолчанию.
+Строки журнала о виде пишет агент seb-rules; сам скрипт пишет только отметку rules-moved.
 Коды: 0 — сделано; 1 — правила (ошибки вида — {"errors": [...]}); 2 — вызов; 3 — окружение.
 """
 
@@ -185,7 +185,7 @@ def tasks_errors(part):
 
 
 def check(data, user):
-    """Ошибки вида по таблице formats.md, раздел «Вид сводки и списка дел»; [] — вид годится.
+    """Ошибки вида по таблице вида formats.md; [] — вид годится.
 
     user=False — вид по умолчанию: оба раздела обязательны; user=True — свой вид: хотя бы один раздел.
     """
@@ -245,7 +245,7 @@ def group_lines(groups, keys):
 
 
 def render(data, head=USER_HEAD):
-    """Текст файла вида по пункту «Текст файла» formats.md; data — проверенный вид (разделы, какие есть)."""
+    """Текст файла вида по formats.md; data — проверенный вид (разделы, какие есть)."""
     lines = [head]
     if "reminders" in data:
         lines += ["", "reminders:"] + group_lines(data["reminders"]["groups"], REMINDER_KEYS)

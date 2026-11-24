@@ -1,16 +1,25 @@
 """Коммит и отправка в main — единственный путь в main для всех исполнителей базы.
 
-python3 engine/scripts/commit.py --who <исполнитель> --message "<что>" [--json] [<пути…>]
+python3 engine/scripts/commit.py --who <исполнитель> --message "<что>" [--lint]
+    [--journal "<что сделал> · <путь>[ · <пояснение>]" …] [--json] [<пути…>]
 
 Никогда не отправляет с --force и никогда не отправляет ветку сессии: только `git push origin HEAD:main`.
+After a successful push origin/main is set locally to the pushed commit: there is no second call to GitHub.
+
+--lint checks the new and changed files among the paths with lint.py before anything is written (deleted paths,
+named but unchanged files and the journals are not checked; a folder stands for its changed files). Violations —
+code 1, status invalid with the list violations: nothing is saved, no journal line is written; lint.py did not run —
+code 3, not_pushed, error starts with «проверка lint.py», nothing written either. --journal (any number of times) —
+a journal line of the executor --who: «<что сделал> · <путь>[ · <пояснение>]» or «поправка · <текст>»; the path must
+be one of the paths of the call. All values are checked before any is written; the lines are written after the
+check, in one write, and leave in the same commit. The answer always has violations (as lint.py) and journal (the
+lines this call wrote — they stay in the day journal even when the commit or the push fails after that).
 
 Every save except --who engine first carries the detailed trace from /tmp/sebra/trace/ into data/log/trace/
 (trace_log.carry); the trace files leave in the same commit as the journal lines.
 """
 
 import argparse
-import errno
-import fcntl
 import json
 import os
 import random
@@ -44,10 +53,13 @@ class Result:
         self.conflicts = []
         self.attempts = 0
         self.error = ""
+        self.violations = []
+        self.journal = []
 
     def as_dict(self):
         return {"status": self.status, "commit": self.commit, "files": self.files,
-                "conflicts": self.conflicts, "attempts": self.attempts, "error": self.error}
+                "conflicts": self.conflicts, "attempts": self.attempts, "error": self.error,
+                "violations": self.violations, "journal": self.journal}
 
 
 class Stop(Exception):
@@ -60,21 +72,11 @@ class Stop(Exception):
 
 
 def lock():
-    lock_path = common.git_out("rev-parse", "--git-path", "sebra-commit.lock")
-    lock_path = os.path.join(common.ROOT, lock_path)
-    f = open(lock_path, "a")
-    deadline = time.monotonic() + LOCK_WAIT
-    while True:
-        try:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return f
-        except OSError as e:
-            if e.errno not in (errno.EAGAIN, errno.EACCES):
-                raise
-            if time.monotonic() >= deadline:
-                f.close()
-                raise Fail(3, "другое сохранение ещё идёт")
-            time.sleep(0.2)
+    """Блокировка сохранений (common.save_lock): ждать идущее сохранение до LOCK_WAIT секунд, затем — отказ."""
+    handle = common.save_lock(LOCK_WAIT)
+    if handle is None:
+        raise Fail(3, "другое сохранение ещё идёт")
+    return handle
 
 
 def porcelain(*pathspec, codes=False):
@@ -288,8 +290,9 @@ def _push(who, res):
 DELETERS = ("seb-restorer", "seb-gardener", "summary")
 
 
-def agent_model_only(rel, cfg):
-    """Файл агента отличается от HEAD только значением строки model: в шапке, и оно равно agents.<имя>."""
+def agent_settings_only(rel, cfg):
+    """Файл агента отличается от HEAD только значениями строк шапки model: и effort:, и каждая равна своему ключу
+    настроек (agents.<имя>, <имя>-effort)."""
     m = re.fullmatch(r"\.claude/agents/seb-([a-z0-9]+(?:-[a-z0-9]+)*)\.md", rel)
     if not m or not os.path.isfile(common.path(rel)):
         return False
@@ -298,21 +301,20 @@ def agent_model_only(rel, cfg):
         return False
     with open(common.path(rel), "rb") as f:
         disk = f.read()
-    want = cfg.get("agents.%s" % m.group(1))
-    if not isinstance(want, str) or common.agent_model(disk) != want:
-        return False
     old, new = head.stdout.split(b"\n"), disk.split(b"\n")
     if len(old) != len(new):
         return False
-    diff = [i for i, (a, b) in enumerate(zip(old, new)) if a != b]
-    if not diff:
-        return True
-    if len(diff) != 1 or common.agent_model(head.stdout) is None:
-        return False
-    i = diff[0]
-    pattern = re.compile(rb"^model:[ \t]*")
-    return bool(pattern.match(old[i]) and pattern.match(new[i])) and \
-        common.agent_model(head.stdout) != common.agent_model(disk)
+    changed = set()
+    for field, pattern, _ in common.AGENT_FIELDS:
+        want = cfg.get(pattern % m.group(1))
+        if not isinstance(want, str) or common.agent_field(disk, field) != want:
+            return False
+        i = common.agent_field_index(head.stdout, field)
+        if i is None or i != common.agent_field_index(disk, field):
+            return False
+        if common.agent_field(head.stdout, field) != want:
+            changed.add(i)
+    return all(a == b or i in changed for i, (a, b) in enumerate(zip(old, new)))
 
 
 def check_rights(who, paths, entries):
@@ -330,10 +332,11 @@ def check_rights(who, paths, entries):
                     cfg = common.config()
                 except Fail:
                     cfg = {}
-            bad = [p for p in touched if cfg is None or not agent_model_only(p, cfg)]
+            bad = [p for p in touched if cfg is None or not agent_settings_only(p, cfg)]
             if bad:
                 if who == "seb-settings":
-                    raise Fail(1, "файл агента меняется только сменой модели через config.py set: %s" % ", ".join(bad))
+                    raise Fail(1, "файл агента меняется только сменой модели или уровня effort через config.py set: %s"
+                               % ", ".join(bad))
                 raise Fail(1, "файлы движка сохраняет только обновление движка (--who engine): %s" % ", ".join(bad))
     if who not in ("engine", "setup") and common.ENGINE_LOCK in named:
         raise Fail(1, "engine.lock сохраняют только настройка и обновление движка")
@@ -350,13 +353,81 @@ def check_rights(who, paths, entries):
 
 def carry_trace():
     """Detailed trace: work files of /tmp/sebra/trace/ go to data/log/trace/ and leave with this save's journal paths;
-    day files older than 30 days are removed in the same commit (formats.md, «Подробный лог»). A failure here does not
+    day files older than 30 days are removed in the same commit (script-formats.md). A failure here does not
     stop the save: the lines stay in the work files and go with the next save."""
     try:
         trace_log.carry(common.ROOT, common.now().date())
     except Exception as e:  # noqa: BLE001
         print("commit.py: подробный лог не перенесён (%s)" % (e.message if isinstance(e, Fail) else e),
               file=sys.stderr)
+
+
+JOURNAL_FORM = "«<что сделал> · <путь>», «<что сделал> · <путь> · <пояснение>» или «поправка · <текст>»"
+
+
+def journal_lines(who, specs, paths, moment):
+    """--journal values → journal lines of the executor, every one checked before any is written.
+
+    «поправка · <текст>» — a correction line; otherwise action, path and an optional note split at the first two «·»
+    (a further «·» stays in the note and becomes a comma, as in journal.py). The path is normalized like the paths of
+    the call and must be one of them: a line is about a file of this save. Fail(2) — a value not by the form.
+    """
+    lines = []
+    for spec in specs:
+        try:
+            first, _, rest = spec.partition("·")
+            if first.strip() == "поправка":
+                lines.append(common.journal_line(who, note=rest, correction=True, moment=moment))
+                continue
+            parts = [x.strip() for x in spec.split("·", 2)]
+            if len(parts) < 2 or not parts[0] or not parts[1]:
+                raise Fail(2, "нужно %s" % JOURNAL_FORM)
+            target = normalize(parts[1])
+            if target not in paths:
+                raise Fail(2, "путь %s не передан на сохранение: строка журнала — только о файле этого сохранения"
+                           % target)
+            lines.append(common.journal_line(who, parts[0], target, parts[2] if len(parts) > 2 else None,
+                                             moment=moment))
+        except Fail as e:
+            raise Fail(2, "--journal «%s»: %s" % (spec, e.message)) from None
+    return lines
+
+
+def lint_changed(entries, res):
+    """--lint: lint.py over the new and changed files of this save (entries of porcelain); deleted files, unchanged
+    named files and the journal are not checked. Violations — Stop(1), status invalid; lint.py did not run — Stop(3).
+    Called before anything is written."""
+    targets = sorted({p for _, p in entries if os.path.isfile(common.path(p))})
+    if not targets:
+        return
+    code, violations, problem = common.run_lint(targets)
+    if code == 3:
+        res.error = problem
+        raise Stop(3, "%s; ничего не сохранено" % problem)
+    if code != 0:
+        res.status = "invalid"
+        res.violations = violations
+        res.error = "в файлах сохранения нарушения формата; ничего не сохранено — исправь и сохрани снова"
+        raise Stop(1, res.error + "".join("\n%s — %s — %s" % (v.get("path"), v.get("rule"), v.get("message"))
+                                          for v in violations))
+
+
+def note_pushed_main(sha):
+    """origin/main := sha, which the push has just put into main on GitHub; no network call.
+
+    A push of one ref with exit code 0 means main on GitHub is sha. git moves origin/main on push only when
+    remote.origin.fetch maps refs/heads/main, and a cloud copy may narrow it to its own branch: the ref is written
+    explicitly. Never backwards: a ref that already contains sha (git moved it on push, or a hook fetched a newer main)
+    stays. The write is conditional on the value read: a concurrent fetch wins.
+    """
+    ref = "refs/remotes/origin/main"
+    old = common.git("rev-parse", "-q", "--verify", ref, check=False).stdout.strip()
+    if old == sha:
+        return
+    if old and common.git("merge-base", "--is-ancestor", sha, old, check=False).returncode == 0:
+        return
+    # old "" — the ref must not exist yet (git update-ref: an empty <oldvalue>)
+    common.git("update-ref", "-m", "commit.py: pushed to main", ref, sha, old, check=False)
 
 
 def run(args, res):
@@ -371,8 +442,16 @@ def run(args, res):
     for p in paths:
         if not os.path.lexists(common.path(p)) and not exists_in_head(p):
             raise Fail(2, "нет такого пути ни на диске, ни в HEAD: %s" % p)
+    # the lines are checked first and written only after the rights and lint.py: a refused save leaves no line
+    moment = common.now() if args.journal else None
+    lines = journal_lines(args.who, args.journal, paths, moment) if args.journal else []
     entries = porcelain(*paths, codes=True) if paths else []
     check_rights(args.who, paths, entries)
+    if args.lint:
+        lint_changed(entries, res)
+    if lines:
+        common.journal_write(moment, lines)
+        res.journal = lines
     if args.who != "engine":
         # the engine update saves and rolls back only its own paths
         carry_trace()
@@ -427,8 +506,8 @@ def run(args, res):
         same = common.git_out("log", "-1", "--format=%s", "HEAD") == subject
         res.files = [f for f in common.git_out("diff-tree", "--no-commit-id", "--name-only", "-r", "--no-renames",
                                                "HEAD").split("\n") if f] if same else []
-    # явный refspec: у облачной копии обычный fetch может не создавать origin/main, а upstream нужна эта ссылка
-    common.git("fetch", "origin", common.MAIN_REFSPEC, check=False, timeout=180)
+    # the push has just put res.commit into main: origin/main is set locally, without a second call to GitHub
+    note_pushed_main(res.commit)
     common.set_upstream_main()
     # стоп-хук облака сравнивает ветку с origin/<ветка>, если она есть: без неё — с origin/HEAD = main
     common.forget_session_ref()
@@ -462,6 +541,9 @@ def _main():
     p = Parser(prog="commit.py")
     p.add_argument("--who", required=True)
     p.add_argument("--message", required=True)
+    p.add_argument("--lint", action="store_true")
+    # one value per parameter: the paths after --journal "…" do not go into it, as they would with nargs
+    p.add_argument("--journal", action="append", default=[])
     p.add_argument("--json", action="store_true")
     p.add_argument("paths", nargs="*")
     json_mode = common.has_json_flag(sys.argv)

@@ -9,7 +9,7 @@ python3 "$CLAUDE_PROJECT_DIR/engine/scripts/session_start.py" (вход — JSON
 Код выхода всегда 0: от хука ничего не зависит, сбой пункта — строка «<пункт>: не удалось (<причина>)».
 
 Detailed trace: the hook puts or removes the flag /tmp/sebra/trace/on by trace.enabled on every run and writes the
-events `session` and `hook` (formats.md, «Подробный лог»); nothing about it goes to stdout.
+events `session` and `hook` (script-formats.md); nothing about it goes to stdout.
 """
 
 import json
@@ -98,7 +98,7 @@ SOURCES = ("startup", "resume", "clear", "compact")
 
 
 def trace_start(inp):
-    """Trace flag by trace.enabled and the `session` event (formats.md, «Подробный лог»). Settings unreadable — the
+    """Trace flag by trace.enabled and the `session` event (script-formats.md). Settings unreadable — the
     flag stays as it was. Prints nothing: stdout goes into the session context."""
     try:
         enabled = common.config().get("trace.enabled", True)

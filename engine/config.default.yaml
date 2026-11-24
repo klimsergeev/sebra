@@ -48,5 +48,15 @@ agents:
   challenger: "fable"          # модель спорщика
   restorer: "sonnet"           # модель отката и удаления
 
+# Уровни обдумывания агентов: low, medium, high, xhigh или max. Значение переносится в поле effort файла агента.
+intake-effort: "low"           # уровень приёма присланного
+answer-effort: "low"           # уровень ответов на вопросы по базе
+digester-effort: "medium"      # уровень разбора больших документов
+gardener-effort: "medium"      # уровень садовника
+reporter-effort: "medium"      # уровень сводок и недельного обзора
+rules-effort: "medium"         # уровень правил из поправок
+challenger-effort: "medium"    # уровень спорщика
+restorer-effort: "medium"      # уровень отката и удаления
+
 trace:
   enabled: yes                 # подробный лог шагов для разработчика: yes — писать, no — не писать

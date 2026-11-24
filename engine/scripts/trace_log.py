@@ -5,11 +5,13 @@ python3 "$CLAUDE_PROJECT_DIR/engine/scripts/trace_log.py" hook                 (
 python3 engine/scripts/trace_log.py report [--session <id>] [--days N] [--json]   — per-turn report in /tmp/sebra/
 python3 engine/scripts/trace_log.py export [--days N] [--json]                    — report and raw events in one file
 
-Event format — formats.md, «Подробный лог». Work files — /tmp/sebra/trace/<session_id>.jsonl (SEBRA_TRACE_DIR for
-tests); only commit.py moves them into data/log/trace/ (carry). At module level only the standard library is imported:
-the hook runs on every Claude Code event and must not load common or YAML. A step label carries only words the engine
-or the system defines (engine set from engine.lock, closed lists below, programs found on the system); anything else
-is «?». Arguments, paths, texts of messages and agent prompts never reach the trace.
+Event format — script-formats.md. Work files — /tmp/sebra/trace/<session_id>.jsonl (workdirs.TRACE); only commit.py
+moves them into data/log/trace/ (carry). At module level only the standard library and workdirs (constants, no
+imports) are imported: the hook runs on every Claude Code event and must not load common or YAML. A step label carries
+only words the engine or the system defines (engine set from engine.lock, closed lists below, programs found on the
+system); anything else is «?». The effort field is a level of the closed list EFFORT_LEVELS or «?». Arguments, paths,
+texts of messages and agent prompts never reach the trace. A subagent started in the background is reported apart from
+the turn that started it: its work goes on after the turn ends.
 """
 
 import fcntl
@@ -21,11 +23,12 @@ import shutil
 import sys
 import time
 
+import workdirs
+
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 # engine/scripts/ -> base root, as common.ROOT
 ROOT = os.path.dirname(os.path.dirname(SCRIPTS_DIR))
 
-TRACE_DIR = "/tmp/sebra/trace"
 OUT_DIR = "/tmp/sebra"
 TMP_DIRS = sorted({"/tmp/sebra", os.path.realpath("/tmp/sebra")})
 UPLOADS = "/root/.claude/uploads"
@@ -36,9 +39,12 @@ DAY_FILE = re.compile(r"^(\d{4}-\d{2}-\d{2})-([A-Za-z0-9_-]{1,128})\.jsonl$")
 TRACE_REL = "data/log/trace"
 KEEP_DAYS = 30
 ROUTINE_PREFIX = "Выполни рутину "
+# as deliver.NOTIFY_PREFIX: a prompt where a subagent reports back, not a user message
+NOTIFY_PREFIX = '<agent-message from="'
+RUN_TOOLS = {"script": ("Bash",), "hook": ("Bash", "Write", "Edit")}  # calls a script / guard.py event can come from
 MAX_LABELS = 8
 
-# Closed set of engine scripts and the subcommands that may appear in a script label (plan of 0.2.3, formats.md).
+# Closed set of engine scripts and the subcommands that may appear in a script label (script-formats.md).
 # A new script or subcommand is added here; until then its label is «?» or the bare script name.
 SCRIPTS = {
     "collect.py": ("now", "history", "slug", "daily", "weekly", "tasks"),
@@ -46,7 +52,7 @@ SCRIPTS = {
     "delete.py": ("path", "tasks", "drafts", "draft"),
     "deliver.py": ("hook-prompt", "hook-stop", "shown", "send", "status"),
     "journal.py": ("add",),
-    "record.py": ("new",),
+    "record.py": ("new", "duplicate"),
     "remind.py": ("add", "cancel", "show"),
     "update_engine.py": ("init", "check", "update"),
     "views.py": ("show", "set", "reset", "rules-moved"),
@@ -89,6 +95,7 @@ HOOK_EVENTS = {
 }
 AGENT_NUMBERS = ("totalDurationMs", "totalToolUseCount", "totalTokens")
 AGENT_WORDS = ("resolvedModel", "status")
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")  # Claude Code effort levels, as common.AGENT_EFFORTS
 SAFE_WORD = re.compile(r"[A-Za-z0-9._:@\[\]/-]{1,100}")
 EXIT_LINE = re.compile(r"Exit code -?\d{1,10}")
 
@@ -104,8 +111,8 @@ SEPARATOR_CHARS = set(";|()\n")
 
 
 def trace_dir():
-    """Folder of work files and of the flag `on`: SEBRA_TRACE_DIR for tests, otherwise /tmp/sebra/trace."""
-    return os.environ.get("SEBRA_TRACE_DIR") or TRACE_DIR
+    """Folder of work files and of the flag `on` (workdirs.TRACE)."""
+    return workdirs.TRACE
 
 
 def clean_sid(sid):
@@ -448,6 +455,10 @@ def hook_event(inp, now, engine):
     aid = inp.get("agent_id")
     if isinstance(aid, str) and aid:
         event["aid"] = aid
+    effort = inp.get("effort")
+    if isinstance(effort, dict) and "level" in effort:
+        # the level that ran (code.claude.com/docs/en/hooks.md, common input fields); not a level of the list — «?»
+        event["effort"] = effort["level"] if effort["level"] in EFFORT_LEVELS else "?"
     x = {}
     if ev in ("pre", "post", "fail"):
         tid, tool = inp.get("tool_use_id"), inp.get("tool_name")
@@ -469,7 +480,8 @@ def hook_event(inp, now, engine):
                     x["exit"] = line
     elif ev == "prompt":
         prompt = inp.get("prompt") if isinstance(inp.get("prompt"), str) else ""
-        x = {"routine": prompt.lstrip().startswith(ROUTINE_PREFIX), "chars": len(prompt)}
+        x = {"routine": prompt.lstrip().startswith(ROUTINE_PREFIX), "notify": prompt.lstrip().startswith(NOTIFY_PREFIX),
+             "chars": len(prompt)}
     elif ev == "compact":
         x = {"phase": "pre" if name == "PreCompact" else "post"}
     if x:
@@ -588,6 +600,8 @@ KIND_NAMES = {"think": "раздумья", "launch": "запуск агента"
               "compact": "сжатие контекста"}
 ENGINE_AGENT = "движок"
 INF = float("inf")
+GUARDED = ("Bash", "Write", "Edit")   # tools guard.py decides on: its matcher in .claude/settings.json
+DENY_WINDOW = 10.0                    # guard.py timeout in .claude/settings.json: it decides within it after the call starts
 
 
 def read_lines(path, shared_lock=False):
@@ -672,10 +686,75 @@ class Turn:
         self.start = prompt["t"]
         self.stop_t = None      # closed end: the first stop or stop_fail after the prompt
         self.next_t = INF       # open end: the next prompt of the session
+        self.runs = {}          # aid -> agent type of the background subagents started in this turn
+
+
+def background_runs(evs):
+    """aid -> (Agent `pre` event that started it, agent type) for subagents started in the background: the `post` of
+    their Agent call has x.status «async_launched» — a background launch returns at once (code.claude.com/docs/en/
+    hooks.md, Agent). A subagent is linked to a call as in account: in time order, to the first not yet linked Agent
+    call that started no later than it. evs — events of one session in time order."""
+    calls = [e for e in evs if e["ev"] == "pre" and e.get("tool") == "Agent"]
+    launched = {e.get("tid") for e in evs if e["ev"] == "post" and e.get("tool") == "Agent" and e.get("tid")
+                and isinstance(e.get("x"), dict) and e["x"].get("status") == "async_launched"}
+    runs, seen, linked = {}, set(), set()
+    if not launched:
+        return runs
+    for e in evs:
+        aid = e.get("aid")
+        if e["ev"] != "sub_start" or not e.get("agent") or not isinstance(aid, str) or aid in seen:
+            continue
+        seen.add(aid)
+        i = next((i for i, c in enumerate(calls) if i not in linked and c["t"] <= e["t"]), None)
+        if i is None:
+            continue
+        linked.add(i)
+        if calls[i].get("tid") in launched:
+            runs[aid] = (calls[i], e["agent"])
+    return runs
+
+
+def call_spans(evs):
+    """[(start, end, tool, aid)] of the tool calls of one session. The end — the call's post or fail; a call guard.py
+    refused gets neither and ends at the refusal (refusals). Any other call without its end lasts while its caller
+    works: a subagent's — to its last sub_stop (a script or guard.py event after it is not the agent's, it belongs to a
+    later turn); the main session's, or a subagent's with no sub_stop in the trace yet, — to the last event."""
+    last = max(e["t"] for e in evs)
+    ends = {e["tid"]: e["t"] for e in evs if e["ev"] in ("post", "fail") and e.get("tid")}
+    refused = refusals(evs)
+    stops = {}
+    for e in evs:
+        if e["ev"] == "sub_stop" and isinstance(e.get("aid"), str) and e["aid"]:
+            stops[e["aid"]] = max(stops.get(e["aid"], e["t"]), e["t"])
+    spans = []
+    for e in evs:
+        if e["ev"] != "pre":
+            continue
+        end = ends.get(e.get("tid"), refused.get(id(e)))
+        if end is None:
+            end = max(stops.get(e.get("aid"), last), e["t"])
+        spans.append((e["t"], end, e.get("tool"), e.get("aid")))
+    return spans
+
+
+def background_owner(e, spans, runs):
+    """aid of the background run a `script` or guard.py `hook` event belongs to: it overlaps calls of that run and of
+    no one else (RUN_TOOLS); otherwise None."""
+    tools = RUN_TOOLS.get(e["ev"])
+    if tools is None or (e["ev"] == "hook" and e.get("what") != "guard.py"):
+        return None
+    start, end = seg_start(e), e["t"]
+    hits = {aid for s, f, tool, aid in spans if tool in tools and s < max(end, start + 1e-9) and f > start}
+    aid = hits.pop() if len(hits) == 1 else None
+    return aid if aid in runs else None
 
 
 def split_turns(events):
-    """(turns, outside): turns of every session in time order; events of no turn — outside."""
+    """(turns, outside): turns of every session in time order; events of no turn — outside.
+
+    A background subagent (background_runs) works on after the turn that started it: its events, and the script and
+    guard.py events it caused, go to that turn whatever their pid and time; analyze counts them apart from the turn.
+    """
     sessions = {}
     for e in events:
         sessions.setdefault(e["sid"], []).append(e)
@@ -700,10 +779,20 @@ def split_turns(events):
             pid = turn.prompt.get("pid")
             if isinstance(pid, str) and pid:
                 by_pid.setdefault(pid, []).append(turn)
+        runs = background_runs(evs)
+        run_turn = {aid: pick_turn(pre, own, by_pid) for aid, (pre, _) in runs.items()}
+        spans = call_spans(evs) if runs else []
         for e in evs:
             if e["ev"] == "prompt":
                 continue
-            turn = pick_turn(e, own, by_pid)
+            aid = e.get("aid") if e.get("aid") in runs else background_owner(e, spans, runs)
+            turn = run_turn.get(aid) if aid else None
+            if turn is not None:
+                if e.get("aid") != aid:
+                    e["_bg"] = aid                   # a script or guard.py event of the run
+                turn.runs[aid] = runs[aid][1]
+            else:
+                turn = pick_turn(e, own, by_pid)
             if turn is None:
                 outside.append(e)
             else:
@@ -735,6 +824,11 @@ def pick_turn(e, turns, by_pid):
     return None
 
 
+def effort_rank(level):
+    """Order of effort levels in the report: from the fastest to the deepest, «?» last."""
+    return EFFORT_LEVELS.index(level) if level in EFFORT_LEVELS else len(EFFORT_LEVELS)
+
+
 class Seg:
     __slots__ = ("start", "end", "kind", "name", "agent", "part", "aid")
 
@@ -753,6 +847,10 @@ class Acc:
         self.agents = {}
         self.detail = {k: {} for k in KINDS}          # kind -> name -> seconds
         self.launch_by_agent = {}                     # agent -> {"prep", "first_step"}
+        self.efforts = {}                             # agent -> effort levels of its tool calls
+
+    def level(self, agent, value):
+        self.efforts.setdefault(agent, set()).add(value if value in EFFORT_LEVELS else "?")
 
     def add(self, kind, seconds, name=None, agent=None, part=None):
         self.kinds[kind] += seconds
@@ -783,13 +881,60 @@ class Acc:
             lp = self.launch_by_agent.setdefault(agent, {"prep": 0.0, "first_step": 0.0})
             for p in lp:
                 lp[p] += vals[p]
+        for agent, levels in other.efforts.items():
+            self.efforts.setdefault(agent, set()).update(levels)
+
+
+def refusal(e):
+    """guard.py event of a refused call: x.deny true (script-formats.md)."""
+    x = e.get("x")
+    return e["ev"] == "hook" and e.get("what") == "guard.py" and isinstance(x, dict) and x.get("deny") is True
+
+
+def refusals(evs):
+    """{id of a `pre` event: end of the call} for the calls guard.py refused.
+
+    A refused call never runs and gets no post or fail, and the refusal — a guard.py `hook` event with x.deny — carries
+    no tool_use_id. So each refusal, in time order, ends the Bash, Write or Edit call without a post or fail of its tid
+    that started nearest to the start of guard.py's work (seg_start), no farther than DENY_WINDOW and not taken by
+    another refusal. The end is the refusal (its t — the end of guard.py's work), never before the call start: the
+    trace hook writes `pre` in the background and may write it later. A call with its own post or fail is never taken.
+    """
+    ended = {e["tid"] for e in evs if e["ev"] in ("post", "fail") and isinstance(e.get("tid"), str) and e["tid"]}
+    waiting = [e for e in evs if e["ev"] == "pre" and e.get("tool") in GUARDED
+               and not (isinstance(e.get("tid"), str) and e["tid"] in ended)]
+    out = {}
+    for h in sorted((e for e in evs if refusal(e)), key=lambda e: (e["t"], e["_seq"])):
+        begin = seg_start(h)
+        near = [e for e in waiting if id(e) not in out and abs(e["t"] - begin) <= DENY_WINDOW]
+        if near:
+            pre = min(near, key=lambda e: (abs(e["t"] - begin), e["t"], e["_seq"]))
+            out[id(pre)] = max(h["t"], pre["t"])
+    return out
 
 
 def analyze(turn):
-    """(Acc, step lines, turn start) — every second of the turn goes to exactly one kind (formats.md, plan of 0.2.3)."""
-    evs = sorted(turn.events, key=lambda e: (e["t"], e["_seq"]))
+    """(Acc, step lines, turn start, background runs): the turn itself is counted without its background subagents; a
+    run — [(agent type, Acc, step lines, run start)] in start order — is counted apart, it goes on after the turn."""
+    main, bg = [], {}
+    for e in turn.events:
+        aid = e.get("_bg") or (e.get("aid") if e.get("aid") in turn.runs else None)
+        (bg.setdefault(aid, []) if aid else main).append(e)
+    acc, lines, start = account(main)
+    runs = []
+    for aid, evs in bg.items():
+        racc, rlines, rstart = account(evs)
+        runs.append((turn.runs[aid], racc, rlines, rstart))
+    runs.sort(key=lambda r: r[3])
+    return acc, lines, start, runs
+
+
+def account(evs):
+    """(Acc, step lines, start) — every second of the events goes to exactly one kind (script-formats.md)."""
+    evs = sorted(evs, key=lambda e: (e["t"], e["_seq"]))
     start = min(seg_start(e) for e in evs)
     end = max(e["t"] for e in evs)
+    refused = refusals(evs)
 
     calls, open_calls = [], {}
     hooks, scripts, compacts, subs = [], [], [], {}
@@ -798,7 +943,8 @@ def analyze(turn):
         ev, t = e["ev"], e["t"]
         if ev == "pre":
             call = {"tid": e.get("tid"), "tool": e.get("tool") or "?", "what": e.get("what"),
-                    "agent": e.get("agent") or "main", "aid": e.get("aid"), "start": t, "end": None, "ms": None}
+                    "agent": e.get("agent") or "main", "aid": e.get("aid"), "start": t, "end": None, "ms": None,
+                    "refused": refused.get(id(e)), "denied": False, "status": None, "effort": e.get("effort")}
             calls.append(call)
             if call["tid"] and call["tid"] not in open_calls:
                 open_calls[call["tid"]] = call
@@ -806,6 +952,8 @@ def analyze(turn):
             call = open_calls.pop(e.get("tid"), None) if e.get("tid") else None
             if call is not None:
                 call["end"], call["ms"] = t, e.get("ms")
+                if isinstance(e.get("x"), dict):
+                    call["status"] = e["x"].get("status")
         elif ev == "hook":
             hooks.append(Seg(seg_start(e), t, "hooks", name=str(e.get("what") or "?"), agent=ENGINE_AGENT))
         elif ev == "script":
@@ -828,6 +976,11 @@ def analyze(turn):
                 sub["stop"] = t
     if compact_open is not None:
         compacts.append(Seg(compact_open, end, "compact"))
+
+    for c in calls:
+        if c["end"] is None and c["refused"] is not None:
+            # guard.py refused the call: no post or fail will come, it ends at the refusal
+            c["end"], c["denied"] = c["refused"], True
 
     # calls of subagents without their sub_start in the turn give no segments
     calls = [c for c in calls if not c["aid"] or c["aid"] in subs]
@@ -883,6 +1036,9 @@ def analyze(turn):
 
     acc = Acc()
     acc.total = end - start
+    for c in calls:                       # the calls the turn keeps: subagent calls without sub_start are dropped above
+        if c["effort"] is not None:
+            acc.level(c["agent"], c["effort"])
     order = (hooks, scripts, compacts, handovers, launches, tools)
     points = {start, end}
     for group in order:
@@ -925,7 +1081,12 @@ def analyze(turn):
     steps = []
     for c in calls:
         label = c["tool"] if not c["what"] or c["what"] == c["tool"] else "%s %s" % (c["tool"], c["what"])
-        work = " (работа %s с)" % sec(c["ms"] / 1000.0) if number(c["ms"]) else ""
+        if c["status"] == "async_launched":
+            label += " (в фоне)"
+        if c["denied"]:
+            work = " (отклонён guard.py)"
+        else:
+            work = " (работа %s с)" % sec(c["ms"] / 1000.0) if number(c["ms"]) else ""
         steps.append((c["start"], c["agent"], label, "%s с%s" % (sec(c["stop"] - c["start"]), work)))
     for s in scripts:
         steps.append((s.start, s.agent, "скрипт " + s.name, "%s с" % sec(s.end - s.start)))
@@ -974,6 +1135,9 @@ def summary_lines(acc):
             parts = ", ".join("%s %s с" % (name, sec(v)) for name, v in detail)
         out.append("- %s: %s с (%s %%)%s" % (KIND_NAMES[kind], sec(value), pct(value, total),
                                               " — " + parts if parts else ""))
+    if acc.efforts:
+        out.append("- уровень effort: " + "; ".join("%s %s" % (agent, ", ".join(sorted(levels, key=effort_rank)))
+                                                     for agent, levels in sorted(acc.efforts.items())))
     return out
 
 
@@ -982,7 +1146,7 @@ def turn_title(n, turn, start, tz):
 
     when = dt.datetime.fromtimestamp(start, tz).strftime("%Y-%m-%d %H:%M:%S")
     x = turn.prompt.get("x") if isinstance(turn.prompt.get("x"), dict) else {}
-    kind = "рутина" if x.get("routine") is True else "сообщение"
+    kind = "рутина" if x.get("routine") is True else "уведомление" if x.get("notify") is True else "сообщение"
     chars = x.get("chars")
     size = ", %d знаков" % chars if isinstance(chars, int) and not isinstance(chars, bool) else ""
     return "## Ход %d — %s, сессия %s (%s%s)" % (n, when, turn.sid, kind, size)
@@ -1002,24 +1166,32 @@ def outside_line(e, tz):
 
 
 def build_report(lines, session, days, tz, title):
-    """(Markdown text, Acc, number of turns)."""
+    """(Markdown text, Acc of the turns, number of turns, (Acc, number) of background runs or None)."""
     events = parse_events(lines, session)
     turns, outside = split_turns(events)
-    total = Acc()
+    total, background, runs = Acc(), Acc(), 0
     parts = ["# %s" % title, "",
              "Дней: %d%s. Ходов: %d. Строка шага — «+секунды от начала хода · агент · шаг · длительность»."
              % (days, ", сессия %s" % session if session else "", len(turns)),
              "Раздумья — промежуток между шагами одного агента: запрос к модели и накладные расходы Claude Code "
              "вместе.", ""]
     for n, turn in enumerate(turns, 1):
-        acc, steps, start = analyze(turn)
+        acc, steps, start, bg = analyze(turn)
         total.merge(acc)
         parts += [turn_title(n, turn, start, tz), ""] + (steps or ["Шагов нет."]) + ["", "Итог хода:"]
         parts += summary_lines(acc) + [""]
+        for agent, racc, rsteps, rstart in bg:
+            background.merge(racc)
+            runs += 1
+            parts += ["### Фоновый агент %s — запуск +%s с от начала хода, в итог хода не входит"
+                      % (agent, sec(rstart - start)), ""]
+            parts += rsteps + ["", "Итог фонового агента:"] + summary_lines(racc) + [""]
     if outside:
         parts += ["## Вне ходов", ""] + [outside_line(e, tz) for e in sorted(outside, key=lambda e: e["t"])] + [""]
     parts += ["## Итог по всем ходам", ""] + summary_lines(total)
-    return "\n".join(parts) + "\n", total, len(turns)
+    if runs:
+        parts += ["", "## Итог фоновых агентов", "", "Запусков: %d." % runs, ""] + summary_lines(background)
+    return "\n".join(parts) + "\n", total, len(turns), ((background, runs) if runs else None)
 
 
 def write_out(name, text):
@@ -1032,11 +1204,17 @@ def write_out(name, text):
     return full
 
 
-def report_json(full, turns, acc):
-    return {"file": full, "turns": turns, "total": r3(acc.total),
-            "kinds": {k: r3(acc.kinds[k]) for k in KINDS},
-            "launch_parts": {k: r3(v) for k, v in acc.parts.items()},
-            "agents": {a: {k: r3(v[k]) for k in AGENT_KINDS} for a, v in sorted(acc.agents.items())}}
+def report_json(full, turns, acc, background=None):
+    """Answer of report --json; key background — only when the log has background runs ((Acc, number) of them)."""
+    out = {"file": full, "turns": turns, "total": r3(acc.total),
+           "kinds": {k: r3(acc.kinds[k]) for k in KINDS},
+           "launch_parts": {k: r3(v) for k, v in acc.parts.items()},
+           "agents": {a: {k: r3(v[k]) for k in AGENT_KINDS} for a, v in sorted(acc.agents.items())}}
+    if background is not None:
+        bacc, runs = background
+        out["background"] = {"runs": runs, "total": r3(bacc.total), "kinds": {k: r3(bacc.kinds[k]) for k in KINDS},
+                             "agents": {a: {k: r3(v[k]) for k in AGENT_KINDS} for a, v in sorted(bacc.agents.items())}}
+    return out
 
 
 def fence_for(lines):
@@ -1083,11 +1261,12 @@ def cli(argv):
         lines = collect_lines(common.ROOT, moment.date(), days)
         stamp = moment.strftime("%Y%m%d-%H%M")
         if args.cmd == "report":
-            text, acc, turns = build_report(lines, args.session, days, tz, "Подробный лог Sebra — отчёт по ходам")
+            text, acc, turns, background = build_report(lines, args.session, days, tz,
+                                                        "Подробный лог Sebra — отчёт по ходам")
             full = write_out("trace-report-%s.md" % stamp, text)
-            out, human = report_json(full, turns, acc), "отчёт: %s" % full
+            out, human = report_json(full, turns, acc, background), "отчёт: %s" % full
         else:
-            text, acc, turns = build_report(lines, None, days, tz, "Подробный лог Sebra")
+            text, acc, turns, _ = build_report(lines, None, days, tz, "Подробный лог Sebra")
             fence = fence_for(lines)
             text += "\n## Сырые события\n\n%sjsonl\n%s\n%s\n" % (fence, "\n".join(lines), fence) if lines else \
                 "\n## Сырые события\n\nНет.\n"

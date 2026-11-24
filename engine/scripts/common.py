@@ -4,6 +4,7 @@
 """
 
 import datetime as _dt
+import errno
 import fcntl
 import json
 import os
@@ -17,6 +18,7 @@ SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 # PyYAML лежит в движке: в облаке его нет, а установка в сессии её не переживает.
 sys.path.insert(0, os.path.join(SCRIPTS_DIR, "_vendor"))
 import yaml  # noqa: E402
+import workdirs  # noqa: E402
 
 # engine/scripts/ → корень базы
 ROOT = os.path.dirname(os.path.dirname(SCRIPTS_DIR))
@@ -44,14 +46,34 @@ DATA_DIRS = (RECORDS, "data/wiki/topics", "data/wiki/people", "data/wiki/project
 
 WHO = r"seb-[a-z0-9]+(?:-[a-z0-9]+)*|gardener|summary|digester|setup|engine"
 WHO_RE = re.compile(r"^(?:%s)$" % WHO)
-# Строка журнала — выражение раздела «Форматы», «Журнал»; группы с именами нужны collect.py.
+# Строка журнала — выражение из formats.md; группы с именами нужны collect.py.
 LOG_RE = re.compile(
     r"^- (?P<time>(?:[01]\d|2[0-3]):[0-5]\d) · (?P<who>%s)"
     r" · (?:поправка · (?P<text>[^·\n]+)|(?P<action>[^·\n]+?) · (?P<path>[^\s·]+)(?: · (?P<note>[^·\n]+))?)$" % WHO
 )
 WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 AGENT_MODELS = ("opus", "sonnet", "haiku", "fable")
+AGENT_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+EFFORT_KEY = "%s-effort"  # key of the effort level of agent %s, without a section
+# Header line of .claude/agents/seb-<имя>.md that config.py keeps equal to a setting: the field, the key of the
+# setting for the agent name (%s), its values.
+AGENT_FIELDS = (("model", "agents.%s", AGENT_MODELS), ("effort", EFFORT_KEY, AGENT_EFFORTS))
+_AGENT_NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 SLUG = r"[a-z0-9]+(?:-[a-z0-9]+){0,5}"
+
+
+def agent_key_name(key, pattern):
+    """Имя агента, если key — ключ настройки по шаблону pattern из AGENT_FIELDS, иначе None."""
+    prefix, suffix = pattern.split("%s")
+    if not (key.startswith(prefix) and key.endswith(suffix)):
+        return None
+    name = key[len(prefix):len(key) - len(suffix)]
+    return name if _AGENT_NAME.fullmatch(name) else None
+
+
+def agent_keys(values, pattern):
+    """{имя агента: значение} для ключей настроек по шаблону pattern."""
+    return {name: v for name, v in ((agent_key_name(k, pattern), v) for k, v in values.items()) if name}
 
 
 class Fail(Exception):
@@ -73,7 +95,7 @@ def exit_code(value):
 def run_main(main, json_mode=False):
     """Запускает main(); Fail превращает в текст (или {"error"} при --json) и код выхода.
 
-    In the end — the `script` trace event with the exit code (formats.md, «Подробный лог»), also on Fail and sys.exit.
+    In the end — the `script` trace event with the exit code (script-formats.md), also on Fail and sys.exit.
     """
     start = time.time()
     code = 1  # an unexpected exception ends with a traceback and code 1
@@ -218,19 +240,21 @@ def front_matter(text):
 
 
 def _flatten(data, source):
+    """{"раздел.ключ": значение} для ключей в разделах и {"ключ": значение} для ключей без раздела."""
     if not isinstance(data, dict):
         raise Fail(1, "%s: ожидаются разделы и ключи" % source)
     flat = {}
-    for section, keys in data.items():
+    for name, keys in data.items():
         if not isinstance(keys, dict):
-            raise Fail(1, "%s: раздел %s — не набор ключей" % (source, section))
+            flat["%s" % name] = keys  # ключ без раздела
+            continue
         for key, value in keys.items():
-            flat["%s.%s" % (section, key)] = value
+            flat["%s.%s" % (name, key)] = value
     return flat
 
 
 def load_flat(rel):
-    """Файл настроек как {"раздел.ключ": значение}; Fail(1), если не читается."""
+    """Файл настроек как {"раздел.ключ" или "ключ": значение}; Fail(1), если не читается."""
     try:
         text = read_text(rel)
     except FileNotFoundError:
@@ -254,9 +278,10 @@ def config():
     return values
 
 
-# Строки шаблона engine/config.default.yaml: раздел и ключ со значением и комментарием.
+# Строки шаблона engine/config.default.yaml: раздел, ключ раздела и ключ без раздела со значением и комментарием.
 _SECTION_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*):\s*(#.*)?$")
 _KEY_RE = re.compile(r"^(\s+)([A-Za-z_][A-Za-z0-9_]*):(\s*)(.*)$")
+_FLAT_KEY_RE = re.compile(r"^([a-z][a-z0-9]*(?:-[a-z0-9]+)*):([ \t]*)(\S.*)$")
 
 
 def _split_value(rest):
@@ -269,7 +294,7 @@ def _split_value(rest):
 
 
 def template(rel=CONFIG_DEFAULT):
-    """Строки шаблона и места значений: [(номер строки, "раздел.ключ", перед значением, после значения)]."""
+    """Строки шаблона и места значений: [(номер строки, "раздел.ключ" или "ключ", перед значением, после значения)]."""
     lines = read_text(rel).split("\n")
     slots = []
     section = None
@@ -288,6 +313,15 @@ def template(rel=CONFIG_DEFAULT):
                 raise Fail(1, "%s: строка %d не по формату" % (rel, i + 1)) from None
             before = m.group(1) + m.group(2) + ":" + m.group(3)
             slots.append((i, "%s.%s" % (section, m.group(2)), before, tail))
+            continue
+        m = _FLAT_KEY_RE.match(line)
+        if m:
+            try:
+                _, tail = _split_value(m.group(3))
+            except ValueError:
+                raise Fail(1, "%s: строка %d не по формату" % (rel, i + 1)) from None
+            slots.append((i, m.group(1), m.group(1) + ":" + m.group(2), tail))
+            section = None  # ключ раздела после ключа без раздела — строка не по формату
             continue
         raise Fail(1, "%s: строка %d не по формату" % (rel, i + 1))
     return lines, slots
@@ -326,7 +360,7 @@ BOOL_WORDS = {"yes": True, "no": False, "true": True, "false": False}
 
 
 def check_value(key, value, default):
-    """Проверка одного значения по таблице раздела «Форматы», «Настройки»; текст ошибки или None."""
+    """Проверка одного значения по таблице настроек script-formats.md; текст ошибки или None."""
     want = type(default)
     if type(value) is not want:
         names = {str: "строка", int: "целое число", bool: "yes или no"}
@@ -355,6 +389,9 @@ def check_value(key, value, default):
     elif key.startswith("agents."):
         if value not in AGENT_MODELS:
             return "%s: нужно одно из: %s" % (key, ", ".join(AGENT_MODELS))
+    elif agent_key_name(key, EFFORT_KEY):
+        if value not in AGENT_EFFORTS:
+            return "%s: нужно одно из: %s" % (key, ", ".join(AGENT_EFFORTS))
     elif key == "git.author_email":
         if value and "@" not in value:
             return "%s: почта должна содержать @" % key
@@ -398,18 +435,18 @@ def parse_cli_value(key, raw, default):
             m = re.fullmatch(r"(\d{1,2}):(\d{2})", raw.strip())
             if m:
                 value = "%02d:%s" % (int(m.group(1)), m.group(2))
-        elif key.startswith("agents."):
+        elif key.startswith("agents.") or agent_key_name(key, EFFORT_KEY):
             value = raw.strip().lower()
     return value, check_value(key, value, default)
 
 
-# ---------------------------------------------------------------- модели агентов
+# ---------------------------------------------------------------- header lines of agent files: model and effort
 
-_MODEL_LINE = re.compile(rb"^(model:[ \t]*)(.*?)([ \t]*\r?)$")
+_FIELD_LINES = {field: re.compile(rb"^(%s:[ \t]*)(.*?)([ \t]*\r?)$" % field.encode()) for field, _, _ in AGENT_FIELDS}
 
 
-def _model_lines(data):
-    """Номера строк `model:` в шапке файла агента (между первой и второй строкой `---`)."""
+def _field_lines(data, field):
+    """Номера строк `<field>:` в шапке файла агента (между первой и второй строкой `---`)."""
     lines = data.split(b"\n")
     if not lines or lines[0].rstrip(b"\r") != b"---":
         return lines, []
@@ -417,68 +454,82 @@ def _model_lines(data):
     for i in range(1, len(lines)):
         if lines[i].rstrip(b"\r") == b"---":
             return lines, found
-        if _MODEL_LINE.match(lines[i]):
+        if _FIELD_LINES[field].match(lines[i]):
             found.append(i)
-    return lines, []  # шапка не закрыта — строк model: в ней нет
+    return lines, []  # шапка не закрыта — строк поля в ней нет
+
+
+def agent_field_index(data, field):
+    """Номер строки `<field>:` шапки (bytes файла) или None, если строк не ровно одна."""
+    _, found = _field_lines(data, field)
+    return found[0] if len(found) == 1 else None
+
+
+def agent_field(data, field):
+    """Значение строки `<field>:` шапки (bytes файла) или None, если строк не ровно одна."""
+    lines, found = _field_lines(data, field)
+    if len(found) != 1:
+        return None
+    return _FIELD_LINES[field].match(lines[found[0]]).group(2).decode("utf-8", errors="replace")
 
 
 def agent_model(data):
-    """Значение строки `model:` шапки (bytes файла) или None, если строк не ровно одна."""
-    lines, found = _model_lines(data)
-    if len(found) != 1:
-        return None
-    return _MODEL_LINE.match(lines[found[0]]).group(2).decode("utf-8", errors="replace")
+    """Значение строки `model:` шапки или None, если строк не ровно одна."""
+    return agent_field(data, "model")
 
 
 def plan_agent_models(values):
-    """Проверка файлов агентов и новые байты для тех, где модель расходится с values.
+    """Проверка файлов агентов и новые байты для тех, где строки шапки расходятся с values.
 
-    Возвращает [(путь от корня, новые байты, права файла)]; Fail(1), если хоть один файл не годится:
-    файла нет, в шапке не ровно одна строка model:, файл .claude/agents/seb-*.md без ключа agents.<имя>.
+    Строки — по AGENT_FIELDS: model: = agents.<имя>, effort: = <имя>-effort. Возвращает [(путь от корня, новые байты,
+    права файла)], файл — один раз, сколько бы его строк ни менялось; Fail(1), если хоть один файл не годится: файла нет,
+    в шапке не ровно одна строка поля, файл .claude/agents/seb-*.md без ключа поля.
     """
-    keys = {k[len("agents."):]: v for k, v in values.items() if k.startswith("agents.")}
-    errors, plan = [], []
+    errors, files = [], {}
     folder = path(AGENTS_DIR)
     present = []
     if os.path.isdir(folder):
         present = sorted(f[len("seb-"):-len(".md")] for f in os.listdir(folder)
                          if f.startswith("seb-") and f.endswith(".md"))
-    for name in present:
-        if name not in keys:
-            errors.append("%s/seb-%s.md: нет ключа agents.%s в настройках" % (AGENTS_DIR, name, name))
-    for name, value in sorted(keys.items()):
-        rel = "%s/seb-%s.md" % (AGENTS_DIR, name)
-        full = path(rel)
-        try:
-            with open(full, "rb") as f:
-                data = f.read()
-            mode = os.stat(full).st_mode & 0o7777
-        except FileNotFoundError:
-            errors.append("%s: нет файла агента для ключа agents.%s" % (rel, name))
-            continue
-        lines, found = _model_lines(data)
-        if len(found) != 1:
-            errors.append("%s: в шапке строк model: %d, нужна ровно одна" % (rel, len(found)))
-            continue
-        m = _MODEL_LINE.match(lines[found[0]])
-        if m.group(2).decode("utf-8", errors="replace") == value:
-            continue
-        lines[found[0]] = m.group(1) + value.encode("utf-8") + m.group(3)
-        plan.append((rel, b"\n".join(lines), mode))
+    for field, pattern, _ in AGENT_FIELDS:
+        keys = agent_keys(values, pattern)
+        for name in present:
+            if name not in keys:
+                errors.append("%s/seb-%s.md: нет ключа %s в настройках" % (AGENTS_DIR, name, pattern % name))
+        for name, value in sorted(keys.items()):
+            rel = "%s/seb-%s.md" % (AGENTS_DIR, name)
+            if rel not in files:
+                try:
+                    with open(path(rel), "rb") as f:
+                        data = f.read()
+                    files[rel] = [data, os.stat(path(rel)).st_mode & 0o7777, False]
+                except FileNotFoundError:
+                    errors.append("%s: нет файла агента для ключа %s" % (rel, pattern % name))
+                    continue
+            entry = files[rel]
+            lines, found = _field_lines(entry[0], field)
+            if len(found) != 1:
+                errors.append("%s: в шапке строк %s: %d, нужна ровно одна" % (rel, field, len(found)))
+                continue
+            m = _FIELD_LINES[field].match(lines[found[0]])
+            if m.group(2).decode("utf-8", errors="replace") == value:
+                continue
+            lines[found[0]] = m.group(1) + value.encode("utf-8") + m.group(3)
+            entry[0], entry[2] = b"\n".join(lines), True
     if errors:
         raise Fail(1, "\n".join(errors))
-    return plan
+    return [(rel, data, mode) for rel, (data, mode, changed) in sorted(files.items()) if changed]
 
 
 def write_agent_models(plan):
-    """Запись по плану plan_agent_models: только строка model:, права файла те же, атомарно."""
+    """Запись по плану plan_agent_models: только строки model: и effort:, права файла те же, атомарно."""
     for rel, data, mode in plan:
         write_bytes_atomic(path(rel), data, mode)
     return [rel for rel, _, _ in plan]
 
 
 def apply_agent_models(values):
-    """Строка model: в шапке .claude/agents/seb-<имя>.md = agents.<имя>; список изменённых файлов."""
+    """Строки model: и effort: в шапке .claude/agents/seb-<имя>.md = agents.<имя> и <имя>-effort; изменённые файлы."""
     return write_agent_models(plan_agent_models(values))
 
 
@@ -514,22 +565,8 @@ def use_timezone(tz):
 
 
 def now():
-    """Текущее время пользователя (aware datetime, без секунд).
-
-    SEBRA_NOW="ГГГГ-ММ-ДДTЧЧ:ММ" подменяет его для тестов; со смещением (…+00:00) — момент,
-    который переводится в пояс пользователя.
-    """
-    tz = timezone()
-    fake = os.environ.get("SEBRA_NOW")
-    if fake:
-        try:
-            moment = _dt.datetime.fromisoformat(fake)
-        except ValueError:
-            raise Fail(2, "SEBRA_NOW: нужно ГГГГ-ММ-ДДTЧЧ:ММ") from None
-        moment = moment.replace(tzinfo=tz) if moment.tzinfo is None else moment.astimezone(tz)
-    else:
-        moment = _dt.datetime.now(tz)
-    return moment.replace(second=0, microsecond=0)
+    """Текущее время пользователя (aware datetime, без секунд)."""
+    return _dt.datetime.now(timezone()).replace(second=0, microsecond=0)
 
 
 def to_user_time(iso):
@@ -539,6 +576,13 @@ def to_user_time(iso):
 
 def fmt_dt(moment):
     return moment.strftime("%Y-%m-%dT%H:%M")
+
+
+def now_line(moment=None):
+    """«ГГГГ-ММ-ДДTЧЧ:ММ <пояс> <день недели>» — время пользователя одной строкой: так его выводит collect.py now и
+    кладёт в контекст хода хук на сообщение (deliver.py)."""
+    moment = moment or now()
+    return "%s %s %s" % (fmt_dt(moment), config().get("owner.timezone", "UTC"), WEEKDAYS[moment.weekday()])
 
 
 def parse_day(text):
@@ -651,6 +695,30 @@ def forget_session_ref():
             git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main", check=False)
 
 
+SAVE_LOCK = "sebra-commit.lock"  # в папке git копии: сохранения commit.py идут по одному
+
+
+def save_lock(wait):
+    """Блокировка сохранений (SAVE_LOCK): открытый файл — держать, пока идёт работа, затем закрыть; не взята за wait
+    секунд — None. commit.py держит её на всё сохранение, хук на сообщение — на догон main и запись сессии: их git и
+    правки копии не пересекаются. Нет репозитория — Fail(3) от git."""
+    full = os.path.join(ROOT, git_out("rev-parse", "--git-path", SAVE_LOCK))
+    f = open(full, "a")
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return f
+        except OSError as e:
+            if e.errno not in (errno.EAGAIN, errno.EACCES):
+                f.close()
+                raise
+            if time.monotonic() >= deadline:
+                f.close()
+                return None
+            time.sleep(0.2)
+
+
 def ensure_history():
     """Неглубокая копия — догрузить историю. Возвращает "полная" или "догружена"."""
     if git_out("rev-parse", "--is-shallow-repository") != "true":
@@ -695,7 +763,6 @@ def lock_version():
 
 
 # Версия движка, с которой сессия загрузила CLAUDE.md: пишет хук SessionStart, читает хук UserPromptSubmit.
-SESSION_DIR = os.environ.get("SEBRA_SESSION_DIR") or "/tmp/sebra/session"
 _SESSION_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
 
@@ -703,7 +770,7 @@ def session_file(sid):
     """Файл сессии по session_id входа хука; id не годится для имени файла — None."""
     if not isinstance(sid, str) or not _SESSION_ID.fullmatch(sid):
         return None
-    return os.path.join(SESSION_DIR, sid + ".json")
+    return os.path.join(workdirs.SESSION, sid + ".json")
 
 
 def load_session(sid):
@@ -724,7 +791,7 @@ def save_session(sid, data):
     p = session_file(sid)
     if p is None:
         return
-    os.makedirs(SESSION_DIR, exist_ok=True)
+    os.makedirs(workdirs.SESSION, exist_ok=True)
     tmp = p + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
@@ -733,14 +800,11 @@ def save_session(sid, data):
 
 # ---------------------------------------------------------------- подробный лог
 # Events go to /tmp/sebra/trace/<session_id>.jsonl through trace_log.append; commit.py carries them into
-# data/log/trace/ (formats.md, «Подробный лог»). trace_log is imported only after the flag check.
-
-TRACE_DIR_DEFAULT = "/tmp/sebra/trace"
-
+# data/log/trace/ (script-formats.md). trace_log is imported only after the flag check.
 
 def trace_dir():
-    """Folder of the trace flag and work files: SEBRA_TRACE_DIR for tests, otherwise /tmp/sebra/trace."""
-    return os.environ.get("SEBRA_TRACE_DIR") or TRACE_DIR_DEFAULT
+    """Folder of the trace flag and work files (workdirs.TRACE)."""
+    return workdirs.TRACE
 
 
 def trace_on():
@@ -837,10 +901,10 @@ def clean_field(text):
     return re.sub(r"[ \t]+", " ", text).strip()
 
 
-def journal_add(who, action=None, target=None, note=None, correction=False):
-    """Дописывает строку в data/log/<дата>.md под flock; возвращает (файл, строка)."""
+def journal_line(who, action=None, target=None, note=None, correction=False, moment=None):
+    """Journal line by formats.md, checked by LOG_RE; nothing is written. Fail(2) — not a line."""
     check_who(who)
-    moment = now()
+    moment = moment or now()
     if correction:
         if action or target:
             raise Fail(2, "у поправки нет --action и --target")
@@ -860,6 +924,11 @@ def journal_add(who, action=None, target=None, note=None, correction=False):
             line += " · " + extra
     if not LOG_RE.match(line):
         raise Fail(2, "строка журнала не по формату: %s" % line)
+    return line
+
+
+def journal_write(moment, lines):
+    """Appends lines to data/log/<date of moment>.md in one write under flock; returns the file."""
     rel = "%s/%s.md" % (LOG, moment.strftime("%Y-%m-%d"))
     os.makedirs(path(LOG), exist_ok=True)
     with open(path(rel), "a+b") as f:
@@ -870,15 +939,38 @@ def journal_add(who, action=None, target=None, note=None, correction=False):
             if f.tell() > 0:
                 f.seek(-1, os.SEEK_END)
                 if f.read(1) != b"\n":
-                    # иначе после слияния merge=union две строки склеятся
+                    # otherwise two lines stick together after a merge=union
                     data += b"\n"
-            data += (line + "\n").encode("utf-8")
+            data += "".join(line + "\n" for line in lines).encode("utf-8")
             f.seek(0, os.SEEK_END)
             f.write(data)
             f.flush()
         finally:
             fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-    return rel, line
+    return rel
+
+
+def journal_add(who, action=None, target=None, note=None, correction=False):
+    """Дописывает строку в data/log/<дата>.md под flock; возвращает (файл, строка)."""
+    check_who(who)
+    moment = now()
+    line = journal_line(who, action, target, note, correction, moment)
+    return journal_write(moment, [line]), line
+
+
+def run_lint(paths):
+    """lint.py --json over paths in a separate process: (code, violations, problem). Code 3 — lint.py did not run or
+    did not answer as lint.py; violations are None then. A separate process: a broken lint.py cannot stop the caller."""
+    script = path(ENGINE_DIR, "scripts", "lint.py")
+    try:
+        cp = subprocess.run([sys.executable, script, *paths, "--json"], cwd=ROOT, capture_output=True,
+                            encoding="utf-8", errors="replace", timeout=300)
+        data = json.loads(cp.stdout)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+        return 3, None, "проверка lint.py не запустилась: %s" % e
+    if cp.returncode not in (0, 1) or not isinstance(data, dict):
+        return 3, None, "проверка lint.py не прошла: код %d, %s" % (cp.returncode, data)
+    return cp.returncode, data.get("violations") or [], ""
 
 
 # ---------------------------------------------------------------- разбор Markdown и ссылок
@@ -889,8 +981,8 @@ CODE_SPAN = re.compile(r"(`+).+?\1")
 SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 LINK_DEF = re.compile(r"^ {0,3}\[[^\]]+\]:")
 REMINDER_RE = re.compile(r"^- (?P<text>\S.*?) — \[запись\]\(\.\./records/(?P<rec>[^()\s<>/]+\.md)\)$")
-# Хвост напоминания прошлого дня в сводке и её показе: перед тире и после «с» — неразрывные пробелы (formats.md,
-# «Ежедневная сводка»). Строят deliver.py и lint.py, снимают — при сравнении строк напоминаний.
+# Хвост напоминания прошлого дня в сводке и её показе: перед тире и после «с» — неразрывные пробелы (formats.md).
+# Строят deliver.py и lint.py, снимают — при сравнении строк напоминаний.
 NBSP = chr(0x00A0)                                  # неразрывный пробел
 REMINDER_LEFT = NBSP + "— осталось с" + NBSP + "%s"   # %s — ДД.ММ дня напоминания
 _REMINDER_TAILS = re.compile(r"(?:[ %s]— осталось с[ %s]\d{2}\.\d{2}| \(за прошлый день \d{2}\.\d{2}\))$" % (NBSP, NBSP))

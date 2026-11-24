@@ -1,7 +1,7 @@
-"""Настройки базы: init, get, set, migrate. Единственный, кто пишет config.yaml и строку model: в файлах агентов.
+"""Настройки базы: init, get, set, migrate. Единственный, кто пишет config.yaml и строки model: и effort: в файлах агентов.
 
 python3 engine/scripts/config.py init --set key=value … [--json]
-python3 engine/scripts/config.py get key [--json]
+python3 engine/scripts/config.py get key [key …] [--json]
 python3 engine/scripts/config.py set key value [key value …] [--json]
 python3 engine/scripts/config.py migrate --from X --to Y --migrations <файл> --stash <файл> [--json]
 """
@@ -17,7 +17,7 @@ from common import Fail
 
 import yaml
 
-TRACE_KEY = "trace.enabled"  # flag /tmp/sebra/trace/on for the trace hooks (formats.md, «Подробный лог»)
+TRACE_KEY = "trace.enabled"  # flag /tmp/sebra/trace/on for the trace hooks (script-formats.md)
 
 
 class Parser(argparse.ArgumentParser):
@@ -74,23 +74,27 @@ def cmd_init(args):
         for key, value in values.items():
             print("%s: %s" % (key, show(value)))
         for rel in agents:
-            print("модель агента: %s" % rel)
+            print("файл агента изменён: %s" % rel)
     return 0
 
 
 def cmd_get(args):
     defaults = common.defaults()
-    if args.key not in defaults:
-        raise Fail(2, "%s: такого ключа нет; ключи: %s" % (args.key, ", ".join(defaults)))
-    value, source = defaults[args.key], "default"
-    if os.path.exists(common.path(common.CONFIG)):
-        current = common.load_flat(common.CONFIG)
-        if args.key in current:
-            value, source = current[args.key], common.CONFIG
-    if args.json:
-        print(json.dumps({"key": args.key, "value": value, "source": source}, ensure_ascii=False))
+    unknown = [k for k in args.keys if k not in defaults]
+    if unknown:
+        raise Fail(2, "%s: %s; ключи: %s" % (", ".join(unknown),
+                                              "такого ключа нет" if len(unknown) == 1 else "таких ключей нет",
+                                              ", ".join(defaults)))
+    current = common.load_flat(common.CONFIG) if os.path.exists(common.path(common.CONFIG)) else {}
+    found = [{"key": k, "value": current[k] if k in current else defaults[k],
+              "source": common.CONFIG if k in current else "default"} for k in args.keys]
+    if len(found) == 1:
+        # one key — the answer of earlier versions, byte for byte
+        print(json.dumps(found[0], ensure_ascii=False) if args.json else show(found[0]["value"]))
+    elif args.json:
+        print(json.dumps({"settings": found}, ensure_ascii=False))
     else:
-        print(show(value))
+        print("\n".join("%s: %s" % (s["key"], show(s["value"])) for s in found))
     return 0
 
 
@@ -245,7 +249,7 @@ def cmd_migrate(args):
         print("переименованы: %s" % (", ".join("%s → %s" % kv for kv in renamed.items()) or "нет"))
         print("отложены: %s" % (", ".join(stashed) or "нет"))
         print("возвращены из отложенных: %s" % (", ".join(restored) or "нет"))
-        print("модели агентов переписаны: %s" % (", ".join(agents) or "нет"))
+        print("файлы агентов изменены: %s" % (", ".join(agents) or "нет"))
     return 0
 
 
@@ -256,7 +260,7 @@ def main():
     s.add_argument("--set", action="append")
     s.add_argument("--json", action="store_true")
     s = sub.add_parser("get")
-    s.add_argument("key")
+    s.add_argument("keys", nargs="+")
     s.add_argument("--json", action="store_true")
     s = sub.add_parser("set")
     s.add_argument("pairs", nargs="*")

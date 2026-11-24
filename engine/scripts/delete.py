@@ -23,11 +23,11 @@ import shutil
 import sys
 
 import common
+import workdirs
 from common import Fail
 
 DELETERS = ("seb-restorer", "seb-gardener")
 DRAFTERS = ("seb-intake",)
-DRAFT_COPIES = os.environ.get("SEBRA_DRAFTS_DIR") or "/tmp/sebra/drafts"  # переменная — для тестов
 A_DRAFT = "черновик убран"
 
 
@@ -170,7 +170,7 @@ def cmd_drafts(args):
 
 def copy_target(rel):
     """Путь копии в папке копий; файл с тем же путём за ту же минуту не затирается."""
-    base = os.path.join(DRAFT_COPIES, common.now().strftime("%Y%m%d-%H%M"), rel)
+    base = os.path.join(workdirs.DRAFTS, common.now().strftime("%Y%m%d-%H%M"), rel)
     copy, n = base, 1
     while os.path.lexists(copy):
         n += 1

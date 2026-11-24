@@ -1,6 +1,6 @@
 """Версия движка в базе: init (новая база), check (есть ли новее), update (обновление и откат).
 
-python3 engine/scripts/update_engine.py init [--source <адрес>]
+python3 engine/scripts/update_engine.py init
 python3 engine/scripts/update_engine.py check [--json]
 python3 engine/scripts/update_engine.py update [--to X.Y.Z] [--json]
 
@@ -184,6 +184,26 @@ def run_engine(name, *args):
     return cp.returncode, data, ((cp.stderr or "") + (cp.stdout or "")).strip()
 
 
+def stash_flat_keys(stash_file):
+    """Ключи config.yaml без раздела — в отложенные, их строки — из файла, если в умолчаниях ставимой версии (файлы
+    движка уже её) таких ключей нет: её config.py читает в config.yaml только разделы и отказал бы на шаге 7.
+    Возвращает отложенные ключи."""
+    if any("." not in k for k in common.defaults()):
+        return []
+    values = common.load_flat(common.CONFIG)
+    keys = [k for k in values if "." not in k]
+    if not keys:
+        return []
+    with open(stash_file, encoding="utf-8") as f:
+        stash = json.load(f)
+    stash.update((k, values[k]) for k in keys)
+    lines = common.read_text(common.CONFIG).split("\n")
+    common.write_atomic(common.CONFIG, "\n".join(x for x in lines if not x.startswith(tuple(k + ":" for k in keys))))
+    with open(stash_file, "w", encoding="utf-8") as f:
+        json.dump(stash, f, ensure_ascii=False)
+    return keys
+
+
 # ---------------------------------------------------------------- init
 
 
@@ -208,7 +228,7 @@ def cmd_init(args):
         raise Fail(1, "в первом коммите базы файлы пользователя или данных: %s" % ", ".join(bad))
     version = common.read_text(common.ENGINE_DIR + "/VERSION").strip()
     v = common.version_tuple(version)
-    source = args.source or ENGINE_SOURCE
+    source = ENGINE_SOURCE
     versions = remote_versions(source)
     if v not in versions:
         raise Fail(1, "версии %s нет в %s" % (version, source))
@@ -404,11 +424,17 @@ def update_from_clone(args, lock, installed, target, versions, old_files, tmp, l
             if os.path.lexists(common.path(f)):
                 os.remove(common.path(f))
         remove_empty_dirs(deleted)
-        # 7) настройки и модели агентов — config.py новой версии
+        # 7) настройки и строки model: и effort: агентов — config.py новой версии
+        try:
+            early = stash_flat_keys(stash_file)
+        except Fail as e:
+            raise Rollback("перенос настроек не прошёл: %s" % e.message) from None
         code, cfg, text = run_engine("config.py", "migrate", "--from", vstr(installed), "--to", vstr(target),
                                      "--migrations", migrations, "--stash", stash_file, "--json")
         if code != 0:
             raise Rollback("перенос настроек не прошёл: %s" % text)
+        if early and isinstance(cfg, dict):
+            cfg["stashed"] = early + [k for k in cfg.get("stashed") or [] if k not in early]
         # 8) engine.lock
         with open(stash_file, encoding="utf-8") as f:
             new_stash = json.load(f)
@@ -509,8 +535,7 @@ def say(args, result, text):
 def main():
     p = Parser(prog="update_engine.py")
     sub = p.add_subparsers(dest="cmd")
-    s = sub.add_parser("init")
-    s.add_argument("--source")
+    sub.add_parser("init")
     s = sub.add_parser("check")
     s.add_argument("--json", action="store_true")
     s = sub.add_parser("update")

@@ -6,9 +6,15 @@ python3 engine/scripts/deliver.py shown [--live] [--json]   — сводку п�
 python3 engine/scripts/deliver.py send [--json]             — рутина: сообщение в основную сессию (claude -p --cloud)
 python3 engine/scripts/deliver.py status [--json]           — состояние сводки на сегодня
 
-Хуки: код выхода всегда 0; сбой — строка «deliver.py: …» в stderr. hook-prompt собирает сводку дня и строку о версии
-движка (STALE_TEXT) порознь: сбой одной части не мешает другой, в контекст идёт уцелевшая; сбой обеих или всего хука
-(например, не прочитан JSON на входе) — в контекст ничего. hook-stop при сбое ничего не выводит.
+Хуки: код выхода всегда 0; сбой — строка «deliver.py: …» в stderr. hook-prompt собирает порознь строку о версии
+движка (STALE_TEXT), абзац о сообщении — строку времени пользователя (NOW_LINE) и строку файла сообщения
+(MESSAGE_LINE) — и сводку дня; сбой одной части или строки не мешает остальным, в контекст идёт уцелевшее в этом
+порядке; сбой всех или всего хука (например, не прочитан JSON на входе) — в контекст ничего. Сообщение пользователя
+hook-prompt пишет в свой новый файл в workdirs.MESSAGES — без ссылок на вложения в начале и строк-меток вставленного
+текста; сообщение рутины о сводке и уведомление о завершении агента (NOTIFY_PREFIX) не пишет. Догон main и запись
+сессии основной hook-prompt делает под блокировкой сохранений (common.save_lock), не посреди commit.py; не дождался за
+SYNC_LOCK_WAIT — пропускает до следующего сообщения. В сессии рутины и в ненастроенной базе hook-prompt молчит.
+hook-stop при сбое ничего не выводит.
 Остальные команды: 0 — сделано, 1 — правила или отказ получателя, 2 — вызов, 3 — окружение.
 """
 
@@ -20,27 +26,42 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 import common
 import remind
 import views
+import workdirs
 from common import Fail
 
-DELIVER_DIR = os.environ.get("SEBRA_DELIVER_DIR") or "/tmp/sebra/deliver"
-CLAUDE_BIN = os.environ.get("SEBRA_CLAUDE_BIN") or "claude"
+CLAUDE_BIN = "claude"
 GRACE = _dt.timedelta(minutes=90)      # после summary.time рутина ещё может работать
 MIDNIGHT = _dt.timedelta(minutes=60)   # сколько после предложения вчерашний снимок ещё ждёт отметки
 FETCH_EVERY = 60                        # секунд между fetch в хуке
 FETCH_TIMEOUT = 10
+SYNC_LOCK_WAIT = 5  # секунд ждать идущее сохранение commit.py, прежде чем догонять main и записывать сессию
 SEND_TIMEOUT = 60
 LOG_DAYS = 60                           # сколько дней журнала искать основную сессию
-MAX_CONTEXT = 9000                      # предел контекста хука — 10 000 знаков
+# сводка; предел поля контекста хука — 10 000 знаков, строке о версии и абзацу о сообщении остаётся ~1000
+MAX_CONTEXT = 9000
 ROUTINE_PREFIX = "Выполни рутину "      # так начинается текст каждой рутины в форме
 DELIVERY_PREFIX = "Sebra: сводка дня за "  # так начинается сообщение, которое шлёт send
 STALE_TEXT = "Sebra: сессия начата на версии движка %s, в базе стоит %s."
 STALE_EVERY = _dt.timedelta(minutes=60)  # напоминание о старой версии — не чаще, если сообщений меньше STALE_PROMPTS
 STALE_PROMPTS = 10
+NOW_LINE = "Sebra: СЕЙЧАС — %s"                       # %s — common.now_line(): то же, что выводит collect.py now
+MESSAGE_LINE = "Sebra: сообщение пользователя — %s"   # %s — файл сообщения, на которое отвечает основная сессия
+# Строки-метки вставленного текста во входе хука (code.claude.com/docs/en/hooks.md, UserPromptSubmit input): их ставит
+# Claude Code, а не пользователь
+PASTE_MARK = re.compile(r'^</?pasted_content id="[^"\n]*">$')
+# Ссылки на вложения в начале prompt — @"/root/.claude/uploads/<папка>/<имя>" и пробел перед текстом: их ставит
+# Claude Code, а не пользователь; та же ссылка дальше в тексте — слова пользователя, она остаётся
+ATTACH_REFS = re.compile(r'\s*(?:@"/root/\.claude/uploads/[^"\n]*"\s*)+')
+# Начало prompt, которым агент отчитывается: не сообщение пользователя. Claude Code 2.1.330 начинает уведомление о
+# завершении агента в переднем плане строкой <agent-message from="<id агента>"> (вход хука на сообщение в облачной
+# сессии); id меняется, поэтому признак — начало тега до значения id. Отдельного поля у такого входа нет
+NOTIFY_PREFIX = '<agent-message from="'
 
 A_SESSION = "основная сессия"
 A_SHOWN = "сводка показана"
@@ -153,6 +174,11 @@ def is_delivery(prompt):
     return (prompt or "").lstrip().startswith(DELIVERY_PREFIX)
 
 
+def is_notification(prompt):
+    """Уведомление о завершении агента: его тоже передают хуку на сообщение, но писал его не пользователь."""
+    return (prompt or "").lstrip().startswith(NOTIFY_PREFIX)
+
+
 # ---------------------------------------------------------------- текст сводки
 
 
@@ -247,7 +273,7 @@ def build(day, moment):
         parts.append(render_daily(daily_text))
     text = "\n\n".join(p for p in parts if p)
     if len(text) > MAX_CONTEXT:
-        full = os.path.join(DELIVER_DIR, "summary-%s.md" % day.isoformat())
+        full = os.path.join(workdirs.DELIVER, "summary-%s.md" % day.isoformat())
         write_file(full, text + "\n")
         text = text[:MAX_CONTEXT - 300].rstrip() + "\n…\nПолный текст сводки — в файле %s." % full
     snap = {"date": day.isoformat(), "marker": marker(day), "kind": "ready" if ready else "missing",
@@ -268,7 +294,7 @@ def write_file(full, text):
 
 
 def snap_path(day):
-    return os.path.join(DELIVER_DIR, "%s.json" % day.isoformat())
+    return os.path.join(workdirs.DELIVER, "%s.json" % day.isoformat())
 
 
 def load_snap(day):
@@ -307,6 +333,12 @@ def save_snap(snap):
 # ---------------------------------------------------------------- хук UserPromptSubmit
 
 
+def needs_register():
+    """Эта облачная сессия ещё не записана основной — register её запишет; вне облака — False."""
+    sid = current_session()
+    return bool(sid) and registered_session() != sid
+
+
 def register(moment):
     """Эта облачная сессия — основная: строка журнала и коммит в фоне. Та же сессия — ничего."""
     sid = current_session()
@@ -321,7 +353,7 @@ def register(moment):
 
 def maybe_sync(force=False):
     """Догнать main не чаще раза в FETCH_EVERY секунд: сводку рутина отправляет в main уже после старта сессии."""
-    stamp = os.path.join(DELIVER_DIR, "fetch.stamp")
+    stamp = os.path.join(workdirs.DELIVER, "fetch.stamp")
     try:
         if not force and _dt.datetime.now().timestamp() - os.path.getmtime(stamp) < FETCH_EVERY:
             return
@@ -332,9 +364,9 @@ def maybe_sync(force=False):
 
 
 def routine_session(inp):
-    """Сессия рутины: её первый ход начинается с ROUTINE_PREFIX; id сессии хука запоминается в DELIVER_DIR."""
+    """Сессия рутины: её первый ход начинается с ROUTINE_PREFIX; id сессии хука запоминается в workdirs.DELIVER."""
     sid = str(inp.get("session_id") or "")
-    marks = os.path.join(DELIVER_DIR, "routine-sessions")
+    marks = os.path.join(workdirs.DELIVER, "routine-sessions")
     try:
         with open(marks, encoding="utf-8") as f:
             known = set(f.read().split())
@@ -342,16 +374,61 @@ def routine_session(inp):
         known = set()
     if is_routine(inp.get("prompt")):
         if sid and sid not in known:
-            os.makedirs(DELIVER_DIR, exist_ok=True)
+            os.makedirs(workdirs.DELIVER, exist_ok=True)
             with open(marks, "a", encoding="utf-8") as f:
                 f.write(sid + "\n")
         return True
     return bool(sid) and sid in known
 
 
+def save_message(prompt, moment):
+    """Сообщение пользователя — в свой новый файл в workdirs.MESSAGES; путь или None, если писать нечего.
+
+    Текст — поле prompt как есть, кроме ссылок на вложения в его начале (ATTACH_REFS) и строк-меток вставленного
+    текста (PASTE_MARK): их ставит Claude Code, а из файла текст уходит в неизменяемое тело записи. Сообщение рутины о
+    сводке и уведомление о завершении агента пользователь не писал — файла нет. Имя — минута пользователя и хвост
+    mkstemp: два сообщения одной минуты не делят файл, прежний не перезаписывается.
+    """
+    if not isinstance(prompt, str) or is_delivery(prompt) or is_notification(prompt):
+        return None
+    refs = ATTACH_REFS.match(prompt)
+    rest = prompt[refs.end():] if refs else prompt
+    text = "\n".join(line for line in rest.split("\n") if not PASTE_MARK.match(line.rstrip("\r")))
+    if not text.strip():
+        return None
+    os.makedirs(workdirs.MESSAGES, exist_ok=True)
+    prefix = (moment.strftime("%Y%m%d-%H%M") if moment else "message") + "-"
+    fd, full = tempfile.mkstemp(dir=workdirs.MESSAGES, prefix=prefix, suffix=".txt")
+    with os.fdopen(fd, "wb") as f:
+        f.write(text.encode("utf-8", errors="replace"))
+    return full
+
+
+def message_paragraph(inp):
+    """Абзац о сообщении: строка времени (NOW_LINE) и строка файла сообщения (MESSAGE_LINE), каждая порознь;
+    нет ни одной — None."""
+    lines, moment = [], None
+    try:
+        moment = common.now()
+        lines.append(NOW_LINE % common.now_line(moment))
+    except Exception as e:  # noqa: BLE001 — испорченный config.yaml: без времени, но с файлом сообщения
+        moment = None
+        print("deliver.py: время пользователя не узнано (%s)" % (e.message if isinstance(e, Fail) else e),
+              file=sys.stderr)
+    try:
+        full = save_message(inp.get("prompt"), moment)
+        if full:
+            lines.append(MESSAGE_LINE % full)
+    except Exception as e:  # noqa: BLE001 — сбой записи не мешает времени, напоминанию и сводке
+        print("deliver.py: сообщение пользователя не записано (%s)" % e, file=sys.stderr)
+    return "\n".join(lines) or None
+
+
 def hook_prompt(inp):
     if routine_session(inp) or not configured():
         return None
+    # первым: до сводки с её догоном main по сети и до stale_clock, который при сломанном config.yaml ставит пояс UTC
+    paragraph = message_paragraph(inp)
     try:
         # common.now() — внутри try: испорченный config.yaml (нет пояса пользователя) роняет сводку, но не напоминание
         summary = summary_context(inp, common.now())
@@ -364,15 +441,15 @@ def hook_prompt(inp):
     except Exception as e:  # noqa: BLE001 — напоминание не мешает сводке
         print("deliver.py: версия сессии не сверена (%s)" % e, file=sys.stderr)
         notice = None
-    text = "\n\n".join(p for p in (notice, summary) if p)
+    text = "\n\n".join(p for p in (notice, paragraph, summary) if p)
     if not text:
         return None
     return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": text}}
 
 
 def stale_clock():
-    """Момент для частоты напоминания о версии — в UTC. Пояс пользователя нужен только чтобы прочесть SEBRA_NOW без
-    смещения; config.yaml не читается — пояс UTC, как collect.py при сломанных настройках берёт пояс по умолчанию."""
+    """Момент для частоты напоминания о версии — в UTC. config.yaml не читается — пояс UTC, как collect.py при
+    сломанных настройках берёт пояс по умолчанию: common.now() без пояса не работает."""
     try:
         moment = common.now()
     except Exception:  # noqa: BLE001 — испорченный config.yaml, неизвестный пояс, нет базы поясов
@@ -419,16 +496,32 @@ def summary_context(inp, moment):
     delivery = is_delivery(inp.get("prompt"))
     day = moment.date()
     due = moment >= summary_moment(moment) and not shown_on(day)
-    if due:
+    handle = None
+    if due or needs_register():
         try:
-            maybe_sync(force=delivery)
-        except Exception as e:  # noqa: BLE001 — без сети показываем то, что есть в копии
-            print("deliver.py: main не догнан (%s)" % e, file=sys.stderr)
+            # догон main и строка журнала регистрации меняют копию — не посреди сохранения commit.py, которое может
+            # идти у агента в фоне: его git add, fetch и config упали бы на блокировках git
+            handle = common.save_lock(SYNC_LOCK_WAIT)
+            if handle is None:
+                print("deliver.py: идёт сохранение — main не догнан, сессия не записана", file=sys.stderr)
+        except Exception as e:  # noqa: BLE001 — git не отвечает: как без сети
+            print("deliver.py: блокировка сохранений не взята (%s)" % (e.message if isinstance(e, Fail) else e),
+                  file=sys.stderr)
     try:
-        # после догона: строка журнала и фоновый коммит регистрации делают копию грязной, перемотка на main не пройдёт
-        register(moment)
-    except Exception as e:  # noqa: BLE001 — регистрация не мешает показу
-        print("deliver.py: основная сессия не записана (%s)" % e, file=sys.stderr)
+        if handle and due:
+            try:
+                maybe_sync(force=delivery)
+            except Exception as e:  # noqa: BLE001 — без сети показываем то, что есть в копии
+                print("deliver.py: main не догнан (%s)" % e, file=sys.stderr)
+        if handle:
+            try:
+                # после догона: строка журнала и фоновый коммит регистрации делают копию грязной, перемотка не пройдёт
+                register(moment)
+            except Exception as e:  # noqa: BLE001 — регистрация не мешает показу
+                print("deliver.py: основная сессия не записана (%s)" % e, file=sys.stderr)
+    finally:
+        if handle:
+            handle.close()  # фоновый commit.py регистрации ждёт эту блокировку
     # журнал и из origin/main: копия могла не перемотаться (грязная или впереди main)
     if not due or shown_on(day, main=True):
         return None
@@ -584,7 +677,8 @@ def run_hook(name):
     inp = {}
     try:
         try:
-            inp = json.loads(sys.stdin.read() or "{}")
+            # bytes as UTF-8: the message is copied whole and must not depend on the locale of the cloud machine
+            inp = json.loads(sys.stdin.buffer.read().decode("utf-8", errors="replace") or "{}")
             out = HOOKS[name](inp if isinstance(inp, dict) else {})
             if out:
                 print(json.dumps(out, ensure_ascii=False))

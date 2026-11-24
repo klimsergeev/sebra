@@ -55,7 +55,7 @@ def cmd_now(json_mode):
             "time": moment.strftime("%H:%M"), "weekday": weekday, "timezone": tz,
         }, ensure_ascii=False))
     else:
-        print("%s %s %s" % (common.fmt_dt(moment), tz, weekday))
+        print(common.now_line(moment))
     return 0
 
 

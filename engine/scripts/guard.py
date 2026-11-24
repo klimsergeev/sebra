@@ -1,4 +1,5 @@
 """Хук PreToolUse для Write, Edit и Bash: кто куда пишет и какие команды можно.
+Команды Bash — только в переднем плане: параметр run_in_background — отказ.
 
 python3 "$CLAUDE_PROJECT_DIR/engine/scripts/guard.py" (вход — JSON вызова в stdin).
 
@@ -58,7 +59,11 @@ B_WRITE = "Файлы базы пишутся только инструмент�
 B_DELETE = ("{prog}: удалять, переименовывать и переносить файлы нельзя — удаление только python3 "
             "engine/scripts/delete.py и remind.py; рабочие файлы в /tmp/sebra/ удалять не нужно.")
 B_SHELL = "{prog}: вложенный shell и eval не разрешены — запускай простые команды по одной."
-B_PYTHON = "Python — только скрипты движка: python3 engine/scripts/<имя>.py"
+B_BACKGROUND = ("Команды в фоне не запускаются: ответ пришёл бы не в этом ходе, а шаги разбирают его сразу. Запусти "
+                "ту же команду без run_in_background.")
+B_PYTHON = ("Python — только скрипты движка: python3 engine/scripts/<имя>.py. Свой код на Python — python3 -c, "
+            "python3 - <<EOF, файл .py вне engine/scripts/ — не запускай: что он пишет в базу, хук не видит. "
+            "Ответ скрипта движка читай как есть или ищи в нём через grep, слова и строки считай wc.")
 B_CONFIG = "Настройки меняет только основная сессия навыком seb-settings"
 B_VIEWS = "Вид сводки меняет только агент seb-rules (навык seb-view)"
 SAVED_TIMEOUT = 4   # секунд на каждый из двух вызовов git в common.in_head: хук ограничен 10 секундами
@@ -881,6 +886,8 @@ def decide_bash(ti, inp, root):
     command = ti.get("command")
     if not isinstance(command, str):
         raise ValueError("нет tool_input.command")
+    if ti.get("run_in_background") is True:
+        return "deny", B_BACKGROUND
     cwd = inp.get("cwd") or root
     ctx = Ctx(root, os.path.realpath(cwd), inp.get("agent_type"))
     try:
@@ -916,7 +923,7 @@ def decide(inp):
 
 
 def mark(start, inp, deny):
-    """Trace event `hook` after the decision (formats.md, «Подробный лог»): x.deny — only when denied."""
+    """Trace event `hook` after the decision (script-formats.md): x.deny — only when denied."""
     sid, pid = common.hook_ids(inp)
     common.trace_mark("hook", "guard.py", start, {"deny": True} if deny else None, sid=sid, pid=pid)
 
